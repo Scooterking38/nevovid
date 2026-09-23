@@ -42,7 +42,7 @@ ASCII_CIRCUIT = """
 #XXXX#XX###############XXX#XX#
 #XXXX#XX#XXXXXXX#######XXX#XX#
 #XXXXXXX###XXXXX#######X####X#
-#XXXXXXXXX#XXXXXXXXXXXXX#XXXG#
+#XXXXXXXXXXXXXXXXXXXXXXX#XXXG#
 ##############################
 """
 
