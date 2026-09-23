@@ -66,7 +66,7 @@ def parse_ascii_track(ascii_map: str) -> Tuple[np.ndarray, Tuple[float, float], 
 
 
 # =====================================================================
-# 2. NEVORL ENVIRONMENT (With Ego-Centric Corridor Transformation)
+# 2. NEVORL ENVIRONMENT (Strict Anti-Circling Potential Rewards)
 # =====================================================================
 def build_environment_source(start_pt: Tuple[float, float], goal_pt: Tuple[float, float]) -> str:
     return f"""
@@ -89,11 +89,11 @@ env CyberArena {{
         let rays = raycast_fan(state.pos, state.heading, 2.094, 5, 6.5);
         let bfs_dir = bfs_vector(state.pos, state.target);
         let path_dist = bfs_dist(state.pos, state.target);
-        
-        // Transform corridor vector and velocity into car-local frame
+
+        // Transform corridor direction and velocity into car-local frame
         let ego_dir = rotate(bfs_dir, -state.heading);
         let ego_vel = rotate(state.vel, -state.heading);
-        
+
         // Output dim = 14:
         // [0..4]: rays, [5]: heading, [6]: path_dist, [7..8]: bfs_dir, [9]: z
         // [10]: ego_dir.x (fwd alignment), [11]: ego_dir.y (lateral steer error), [12]: ego_vel.x, [13]: ego_vel.y
@@ -121,10 +121,10 @@ env CyberArena {{
         state.z = clamp(state.z + state.vz, 0.0, 3.0);
         state.vz = where(state.z <= 0.0, 0.0, state.vz);
 
-        // Agile kinematics: steer_rate=0.35, drag=0.55, radius=0.32 for clean cornering
-        let hit = kinematics_car(act[0], act[1], 0.45, 0.90, 0.35, 0.55, 0.10, 0.32, state.z);
+        // High traction (0.78), responsive steering (0.38), compact radius (0.30)
+        let hit = kinematics_car(act[0], act[1], 0.78, 0.85, 0.38, 0.50, 0.05, 0.30, state.z);
 
-        let touching_wall = is_wall(state.pos, 0.32);
+        let touching_wall = is_wall(state.pos, 0.30);
         let landed_on_wall = (state.z <= 0.08) and touching_wall;
 
         state.crashed = where(hit or landed_on_wall, 1.0, 0.0);
@@ -134,30 +134,36 @@ env CyberArena {{
     reward {{
         let path_dist = bfs_dist(state.pos, state.target);
         let bfs_dir = bfs_vector(state.pos, state.target);
-        let ego_dir = rotate(bfs_dir, -state.heading);
-        let ego_vel = rotate(state.vel, -state.heading);
 
-        // Dense alignment and corridor progression
-        let fwd_progress = ego_vel.x;
-        let corridor_align = ego_dir.x; // +1 facing corridor, -1 facing opposite
+        // Velocity along the actual shortest path corridor in WORLD frame
+        let corridor_vel = state.vel.x * bfs_dir.x + state.vel.y * bfs_dir.y;
+
+        // Alignment with corridor (+1 facing path, -1 facing opposite)
+        let fwd_x = cos(state.heading);
+        let fwd_y = sin(state.heading);
+        let alignment = fwd_x * bfs_dir.x + fwd_y * bfs_dir.y;
+
+        // Heavy penalty for driving the wrong way or doing donuts
+        let wrong_way = where(alignment < -0.2, 4.0, 0.0);
+        let fwd_reward = clamp(corridor_vel * 14.0, -4.0, 14.0);
 
         let reached_goal = (path_dist < 1.8) and (state.z <= 0.08);
-        let progress_reward = fwd_progress * 8.0 + corridor_align * 2.0;
-        let goal_bonus = where(reached_goal, 3000.0, 0.0);
-        let crash_tax = where(state.crashed > 0.5, 40.0, 0.0);
+        let goal_bonus = where(reached_goal, 5000.0, 0.0);
+        let crash_tax = where(state.crashed > 0.5, 60.0, 0.0);
 
-        return progress_reward + goal_bonus - crash_tax;
+        // -0.2 step tax forces agents to actively progress rather than loiter
+        return fwd_reward + alignment * 2.0 - wrong_way - 0.2 + goal_bonus - crash_tax;
     }}
 
     terminal {{
         let path_dist = bfs_dist(state.pos, state.target);
-        return ((path_dist < 1.8) and (state.z <= 0.08)) or (state.crashed > 0.5) or (state.steps >= 340);
+        return ((path_dist < 1.8) and (state.z <= 0.08)) or (state.crashed > 0.5) or (state.steps >= 360);
     }}
 }}
 """
 
 # =====================================================================
-# 3. BATCHED NEUROEVOLUTION ENGINE (2-Layer Tanh + Multi-Scale Mutation)
+# 3. FAST NEUROEVOLUTION ENGINE (Seeded Prior + Truncation Selection)
 # =====================================================================
 class FastNeuroEvolution:
     def __init__(self, pop_size=1024, in_dim=14, out_dim=3):
@@ -166,20 +172,37 @@ class FastNeuroEvolution:
         self.out_dim = out_dim
 
         # Layer 1: 14 -> 32
-        self.W1 = (np.random.randn(pop_size, in_dim, 32).astype(np.float32) * np.sqrt(2.0 / in_dim))
+        self.W1 = np.random.randn(pop_size, in_dim, 32).astype(np.float32) * 0.05
         self.b1 = np.zeros((pop_size, 32), dtype=np.float32)
 
         # Layer 2: 32 -> 16
-        self.W2 = (np.random.randn(pop_size, 32, 16).astype(np.float32) * np.sqrt(2.0 / 32))
+        self.W2 = np.random.randn(pop_size, 32, 16).astype(np.float32) * 0.05
         self.b2 = np.zeros((pop_size, 16), dtype=np.float32)
 
         # Layer 3: 16 -> 3
-        self.W3 = (np.random.randn(pop_size, 16, out_dim).astype(np.float32) * np.sqrt(2.0 / 16))
+        self.W3 = np.random.randn(pop_size, 16, out_dim).astype(np.float32) * 0.05
         self.b3 = np.zeros((pop_size, out_dim), dtype=np.float32)
 
-        # Inductive bias: forward drive, straight steering, jump disabled by default
-        self.b3[:, 1] = 1.0   # throttle bias (+1.0)
-        self.b3[:, 2] = -0.5  # jump thruster bias (off)
+        # --- SEED HIGH-PERFORMANCE STEERING PRIOR ---
+        # Connect ego_dir.y (input index 11) directly to steer actuator (act[0])
+        self.W1[:, 11, 0] = 2.0   # ego_dir.y -> h1[0]
+        self.W2[:, 0, 0] = 1.8    # h1[0] -> h2[0]
+        self.W3[:, 0, 0] = 1.5    # h2[0] -> steer (act[0])
+
+        # Centering raycasts: left rays push steer right, right rays push steer left
+        self.W1[:, 0, 0] = 0.5    # left-most ray
+        self.W1[:, 1, 0] = 0.7    # left-diagonal ray
+        self.W1[:, 3, 0] = -0.7   # right-diagonal ray
+        self.W1[:, 4, 0] = -0.5   # right-most ray
+
+        # Default forward drive, straight steering, thrusters ready
+        self.b3[:, 1] = 1.8       # throttle (+1.0 saturated)
+        self.b3[:, 2] = -0.8      # jump off by default
+
+        # Add initial population diversity around the prior
+        self.W1 += np.random.randn(*self.W1.shape).astype(np.float32) * 0.06
+        self.W2 += np.random.randn(*self.W2.shape).astype(np.float32) * 0.06
+        self.W3 += np.random.randn(*self.W3.shape).astype(np.float32) * 0.06
 
         self.generation = 0
         self.last_hidden = np.zeros((pop_size, 16), dtype=np.float32)
@@ -209,8 +232,8 @@ class FastNeuroEvolution:
         elites_w3 = self.W3[ranks[:num_elites]].copy()
         elites_b3 = self.b3[ranks[:num_elites]].copy()
 
-        # Sample parents from top 12% with rank-based decay
-        top_pool_size = max(num_elites, int(self.pop_size * 0.12))
+        # Truncation selection: sample parents from top 10% with rank weighting
+        top_pool_size = max(num_elites, int(self.pop_size * 0.10))
         top_indices = ranks[:top_pool_size]
         weights = 1.0 / np.sqrt(np.arange(1, top_pool_size + 1))
         probs = weights / np.sum(weights)
@@ -224,9 +247,9 @@ class FastNeuroEvolution:
         new_W3 = self.W3[chosen].copy()
         new_b3 = self.b3[chosen].copy()
 
-        # Multi-scale mutation strengths: 50% fine, 35% medium, 15% broad exploration
-        sigmas = np.random.choice([0.03, 0.10, 0.25], size=(self.pop_size, 1, 1), p=[0.50, 0.35, 0.15]).astype(np.float32)
-        p_mut = 0.20
+        # Multi-scale mutations (60% fine, 30% medium, 10% coarse)
+        sigmas = np.random.choice([0.02, 0.08, 0.20], size=(self.pop_size, 1, 1), p=[0.60, 0.30, 0.10]).astype(np.float32)
+        p_mut = 0.18
 
         m1 = np.random.rand(*new_W1.shape) < p_mut
         new_W1 += (m1 * np.random.randn(*new_W1.shape)).astype(np.float32) * sigmas
@@ -240,7 +263,7 @@ class FastNeuroEvolution:
         new_W3 += (m3 * np.random.randn(*new_W3.shape)).astype(np.float32) * sigmas
         new_b3 += ((np.random.rand(*new_b3.shape) < p_mut) * np.random.randn(*new_b3.shape)).astype(np.float32) * sigmas.squeeze(-1)
 
-        # Strictly preserve the champions untouched
+        # Preserve top champions untouched
         new_W1[:num_elites] = elites_w1
         new_b1[:num_elites] = elites_b1
         new_W2[:num_elites] = elites_w2
@@ -252,7 +275,7 @@ class FastNeuroEvolution:
         self.W2, self.b2 = new_W2, new_b2
         self.W3, self.b3 = new_W3, new_b3
 
-    def train_epoch(self, envs, generations=60, rollout_steps=320, verbose=True):
+    def train_epoch(self, envs, generations=60, rollout_steps=340, verbose=True):
         t0 = time.perf_counter()
         top_fit = -9999.0
 
@@ -261,18 +284,18 @@ class FastNeuroEvolution:
             fitness = np.zeros(self.pop_size, dtype=np.float32)
             alive = np.ones(self.pop_size, dtype=bool)
 
-            # Potential-based progress tracking: record minimum distance achieved
+            # Record initial distance to track true net progress
             init_dist = obs[:, 6].copy()
             min_dist = init_dist.copy()
 
             for _ in range(rollout_steps):
                 act = self.forward(obs)
-                noise = np.random.randn(*act.shape).astype(np.float32) * 0.03
+                noise = np.random.randn(*act.shape).astype(np.float32) * 0.02
                 act_noisy = np.clip(act + noise, -1.0, 1.0)
 
                 obs, rewards, term, trunc, _ = envs.step(act_noisy)
 
-                # Only alive agents accumulate fitness; dead agents freeze
+                # Only alive agents accumulate rewards
                 fitness += np.where(alive, rewards, 0.0)
                 cur_dist = obs[:, 6]
                 min_dist = np.where(alive & (cur_dist < min_dist), cur_dist, min_dist)
@@ -281,15 +304,15 @@ class FastNeuroEvolution:
                 if not np.any(alive):
                     break
 
-            # Distance-to-goal progress reward prevents any reward-hacking
+            # Heavy bonus on true corridor progress (ending circle exploits)
             net_progress = np.maximum(0.0, init_dist - min_dist)
-            fitness += net_progress * 18.0
+            fitness += net_progress * 45.0
 
             top_fit = float(np.max(fitness))
             min_rem_dist = float(np.min(min_dist))
 
             if verbose and (gen % 5 == 0 or gen == generations - 1):
-                print(f"   Gen {gen:02d}/{generations} | Top Fit: {top_fit:7.1f} | Closest Target: {min_rem_dist:4.1f} units")
+                print(f"   Gen {gen:02d}/{generations} | Top Fit: {top_fit:7.1f} | Closest to Goal: {min_rem_dist:4.1f} units")
 
             self.evolve(fitness)
 
@@ -299,7 +322,7 @@ class FastNeuroEvolution:
 
     def evolve_more(self, env_cls, maze, generations=10):
         envs = env_cls(num_envs=self.pop_size, grid_map=maze)
-        self.train_epoch(envs, generations=generations, rollout_steps=320, verbose=True)
+        self.train_epoch(envs, generations=generations, rollout_steps=340, verbose=True)
 
 
 # =====================================================================
@@ -406,13 +429,13 @@ class CyberVisualizer:
         pygame.draw.rect(self.screen, (34, 197, 94), (235, self.arena_h + 56, gas_bar_w, 12))
         self.screen.blit(self.font_tiny.render(f"GAS   [{gas_val:.2f}]", True, (203, 213, 225)), (355, self.arena_h + 56))
 
-        # Jump thruster indicator
+        # Jump indicator
         is_firing = jump_val > 0.0
         jump_color = (192, 132, 252) if is_firing else (71, 85, 105)
         jump_state = "FIRING" if is_firing else "GROUND"
         self.screen.blit(self.font_main.render(f"JUMP THRUSTER: [{jump_state}]", True, jump_color), (235, self.arena_h + 74))
 
-        # Controls info
+        # Shortcuts Guide
         pygame.draw.line(self.screen, (30, 41, 59), (480, self.arena_h + 10), (480, self.arena_h + 90), 1)
         self.screen.blit(self.font_main.render("AUTONOMOUS CONTROL", True, (168, 85, 247)), (500, self.arena_h + 12))
         keys = [
@@ -570,7 +593,7 @@ class CyberVisualizer:
                     pygame.draw.line(self.screen, laser_c, (ax, ay), (ex, ey), 1)
                     pygame.draw.circle(self.screen, laser_c, (ex, ey), 3)
 
-            # 6. Lifted Car Body
+            # 6. Car Body
             lift_y = int(c_alt * 24)
             scale = 1.0 + c_alt * 0.18
 
@@ -647,7 +670,7 @@ def main():
     train_envs = CyberArenaCls(num_envs=args.pop_size, grid_map=maze)
     ga = FastNeuroEvolution(pop_size=args.pop_size, in_dim=14, out_dim=3)
 
-    elapsed, sps, top_fit = ga.train_epoch(train_envs, generations=args.generations, rollout_steps=320, verbose=True)
+    elapsed, sps, top_fit = ga.train_epoch(train_envs, generations=args.generations, rollout_steps=340, verbose=True)
     print(f"\n   Done in {elapsed:.2f}s! ({sps:,.0f} agent-steps/sec)")
     print(f"   Champion Fitness: {top_fit:.1f}")
 
