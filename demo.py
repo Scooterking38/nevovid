@@ -37,11 +37,11 @@ ASCII_CIRCUIT = """
 #XXXXXXXXXXXXXX#XXXX#####X##X#
 #XXXX##########XXXXX#####X#XX#
 #XXXX#XX#################X#X##
-#XXXX#XX#################X#XX#
-#XXXX#XX################XX##X#
+#XXXX#XX####XXXXXXXX#####X#XX#
+#XXXX#XX#####XXXXXXXX###XX##X#
 #XXXX#XX###############XXX#XX#
-#XXXX#XX###############XXX#XX#
-#XXXXXXX###############X####X#
+#XXXX#XX#XXXXXXX#######XXX#XX#
+#XXXXXXX###XXXXX#######X####X#
 #XXXXXXXXX#XXXXXXXXXXXXX#XXXG#
 ##############################
 """
