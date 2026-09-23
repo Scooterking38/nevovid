@@ -1,0 +1,58 @@
+name: NevoRL CyberArena Simulation & Video Export
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      generations:
+        description: 'Number of training generations'
+        required: false
+        default: '60'
+      frames:
+        description: 'Frames to record (60 FPS, 600 = 10s)'
+        required: false
+        default: '600'
+
+jobs:
+  simulate-and-record:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb ffmpeg libsdl2-dev
+
+      - name: Install Python Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Simulation and Record Video
+        run: |
+          GENS="${{ github.event.inputs.generations || '60' }}"
+          FRAMES="${{ github.event.inputs.frames || '600' }}"
+          echo "Training with $GENS generations and recording $FRAMES frames..."
+          xvfb-run -a -s "-screen 0 1280x1024x24" python demo.py \
+            --video cyber_arena.mp4 \
+            --frames "$FRAMES" \
+            --generations "$GENS"
+
+      - name: Upload Video Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cyber-arena-simulation-video
+          path: cyber_arena.mp4
+          if-no-files-found: error
