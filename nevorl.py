@@ -222,7 +222,7 @@ def resolve_wall_slide(pos: np.ndarray, vel: np.ndarray, radius: float, elastici
         cur_vel[:, 0] = np.where(hit_x, -cur_vel[:, 0] * elasticity, cur_vel[:, 0])
 
         cand_y = cur_pos[:, 1] + sub_vel[:, 1]
-        hit_y = check_circle_aabb_collision(np.column_stack([cur_pos[:, 0], cand_y]]), radius, grid_map)
+        hit_y = check_circle_aabb_collision(np.column_stack([cur_pos[:, 0], cand_y]), radius, grid_map)
         cur_pos[:, 1] = np.where(hit_y, cur_pos[:, 1], cand_y)
         cur_vel[:, 1] = np.where(hit_y, -cur_vel[:, 1] * elasticity, cur_vel[:, 1])
 
