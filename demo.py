@@ -9,7 +9,7 @@ import argparse
 from typing import Tuple
 import numpy as np
 
-# If running headlessly on Linux without an X11 server, fallback to dummy SDL video driver
+# Fallback to dummy video driver if headless Linux without display server
 if "DISPLAY" not in os.environ and sys.platform.startswith("linux"):
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
@@ -17,7 +17,7 @@ import pygame
 from nevorl import NevoRLCompiler
 
 # =====================================================================
-# 1. 30x24 ASCII CIRCUIT ('X' = Blank, '#' = Wall, 'S' = Start, 'G' = Goal)
+# 1. 30x24 ASCII CIRCUIT ('X' = Open Track, '#' = Wall, 'S' = Start, 'G' = Goal)
 # =====================================================================
 ASCII_CIRCUIT = """
 ##############################
@@ -66,7 +66,7 @@ def parse_ascii_track(ascii_map: str) -> Tuple[np.ndarray, Tuple[float, float], 
 
 
 # =====================================================================
-# 2. NEVORL ENVIRONMENT (Strict Anti-Circling Potential Rewards)
+# 2. NEVORL ENVIRONMENT
 # =====================================================================
 def build_environment_source(start_pt: Tuple[float, float], goal_pt: Tuple[float, float]) -> str:
     return f"""
@@ -95,7 +95,7 @@ env CyberArena {{
         let ego_vel = rotate(state.vel, -state.heading);
 
         // Output dim = 14:
-        // [0..4]: rays, [5]: heading, [6]: path_dist, [7..8]: bfs_dir, [9]: z
+        // [0..4]: rays (-60°, -30°, 0°, +30°, +60°), [5]: heading, [6]: path_dist, [7..8]: bfs_dir, [9]: z
         // [10]: ego_dir.x (fwd alignment), [11]: ego_dir.y (lateral steer error), [12]: ego_vel.x, [13]: ego_vel.y
         return [rays, state.heading, path_dist, bfs_dir.x, bfs_dir.y, state.z, ego_dir.x, ego_dir.y, ego_vel.x, ego_vel.y];
     }}
@@ -121,10 +121,10 @@ env CyberArena {{
         state.z = clamp(state.z + state.vz, 0.0, 3.0);
         state.vz = where(state.z <= 0.0, 0.0, state.vz);
 
-        // High traction (0.78), responsive steering (0.38), compact radius (0.30)
-        let hit = kinematics_car(act[0], act[1], 0.78, 0.85, 0.38, 0.50, 0.05, 0.30, state.z);
+        // High traction (0.82), agile steering (0.42), compact radius (0.28)
+        let hit = kinematics_car(act[0], act[1], 0.82, 0.88, 0.42, 0.45, 0.05, 0.28, state.z);
 
-        let touching_wall = is_wall(state.pos, 0.30);
+        let touching_wall = is_wall(state.pos, 0.28);
         let landed_on_wall = (state.z <= 0.08) and touching_wall;
 
         state.crashed = where(hit or landed_on_wall, 1.0, 0.0);
@@ -135,35 +135,30 @@ env CyberArena {{
         let path_dist = bfs_dist(state.pos, state.target);
         let bfs_dir = bfs_vector(state.pos, state.target);
 
-        // Velocity along the actual shortest path corridor in WORLD frame
+        // Velocity along shortest path corridor in WORLD frame
         let corridor_vel = state.vel.x * bfs_dir.x + state.vel.y * bfs_dir.y;
 
-        // Alignment with corridor (+1 facing path, -1 facing opposite)
+        // Alignment with path direction
         let fwd_x = cos(state.heading);
         let fwd_y = sin(state.heading);
         let alignment = fwd_x * bfs_dir.x + fwd_y * bfs_dir.y;
-
-        // Heavy penalty for driving the wrong way or doing donuts
-        let wrong_way = where(alignment < -0.2, 4.0, 0.0);
-        let fwd_reward = clamp(corridor_vel * 14.0, -4.0, 14.0);
 
         let reached_goal = (path_dist < 1.8) and (state.z <= 0.08);
         let goal_bonus = where(reached_goal, 5000.0, 0.0);
         let crash_tax = where(state.crashed > 0.5, 60.0, 0.0);
 
-        // -0.2 step tax forces agents to actively progress rather than loiter
-        return fwd_reward + alignment * 2.0 - wrong_way - 0.2 + goal_bonus - crash_tax;
+        return corridor_vel * 15.0 + alignment * 2.5 - 0.2 + goal_bonus - crash_tax;
     }}
 
     terminal {{
         let path_dist = bfs_dist(state.pos, state.target);
-        return ((path_dist < 1.8) and (state.z <= 0.08)) or (state.crashed > 0.5) or (state.steps >= 360);
+        return ((path_dist < 1.8) and (state.z <= 0.08)) or (state.crashed > 0.5) or (state.steps >= 340);
     }}
 }}
 """
 
 # =====================================================================
-# 3. FAST NEUROEVOLUTION ENGINE (Seeded Prior + Truncation Selection)
+# 3. HIGH-SPEED NEUROEVOLUTION ENGINE
 # =====================================================================
 class FastNeuroEvolution:
     def __init__(self, pop_size=1024, in_dim=14, out_dim=3):
@@ -172,37 +167,43 @@ class FastNeuroEvolution:
         self.out_dim = out_dim
 
         # Layer 1: 14 -> 32
-        self.W1 = np.random.randn(pop_size, in_dim, 32).astype(np.float32) * 0.05
+        self.W1 = np.random.randn(pop_size, in_dim, 32).astype(np.float32) * 0.02
         self.b1 = np.zeros((pop_size, 32), dtype=np.float32)
 
         # Layer 2: 32 -> 16
-        self.W2 = np.random.randn(pop_size, 32, 16).astype(np.float32) * 0.05
+        self.W2 = np.random.randn(pop_size, 32, 16).astype(np.float32) * 0.02
         self.b2 = np.zeros((pop_size, 16), dtype=np.float32)
 
         # Layer 3: 16 -> 3
-        self.W3 = np.random.randn(pop_size, 16, out_dim).astype(np.float32) * 0.05
+        self.W3 = np.random.randn(pop_size, 16, out_dim).astype(np.float32) * 0.02
         self.b3 = np.zeros((pop_size, out_dim), dtype=np.float32)
 
-        # --- SEED HIGH-PERFORMANCE STEERING PRIOR ---
-        # Connect ego_dir.y (input index 11) directly to steer actuator (act[0])
-        self.W1[:, 11, 0] = 2.0   # ego_dir.y -> h1[0]
-        self.W2[:, 0, 0] = 1.8    # h1[0] -> h2[0]
-        self.W3[:, 0, 0] = 1.5    # h2[0] -> steer (act[0])
+        # --- SEED HIGH-PERFORMANCE STEERING & APEX BRAKING PRIOR ---
+        # 1. Channel corridor lateral error (ego_dir.y, idx 11) to steer (act[0])
+        self.W1[:, 11, 0] = 2.4
+        # Wall repulsion: right rays minus left rays (positive = steer right away from left wall)
+        self.W1[:, 0, 0] = -0.4   # left-most ray
+        self.W1[:, 1, 0] = -0.7   # left diagonal ray
+        self.W1[:, 3, 0] = 0.7    # right diagonal ray
+        self.W1[:, 4, 0] = 0.4    # right-most ray
+        self.W2[:, 0, 0] = 1.8
+        self.W3[:, 0, 0] = 1.5
 
-        # Centering raycasts: left rays push steer right, right rays push steer left
-        self.W1[:, 0, 0] = 0.5    # left-most ray
-        self.W1[:, 1, 0] = 0.7    # left-diagonal ray
-        self.W1[:, 3, 0] = -0.7   # right-diagonal ray
-        self.W1[:, 4, 0] = -0.5   # right-most ray
+        # 2. Dynamic Speed Control: brake into sharp corners, full throttle on straights
+        self.W1[:, 10, 1] = 1.6   # ego_dir.x (fwd corridor alignment)
+        self.W1[:, 2, 1] = 1.4    # center ray clearance
+        self.b1[:, 1] = -0.6
+        self.W2[:, 1, 1] = 1.5
+        self.W3[:, 1, 1] = 1.2
+        self.b3[:, 1] = 0.7       # baseline forward thrust
 
-        # Default forward drive, straight steering, thrusters ready
-        self.b3[:, 1] = 1.8       # throttle (+1.0 saturated)
-        self.b3[:, 2] = -0.8      # jump off by default
+        # 3. Jump thruster: grounded by default
+        self.b3[:, 2] = -1.2
 
-        # Add initial population diversity around the prior
-        self.W1 += np.random.randn(*self.W1.shape).astype(np.float32) * 0.06
-        self.W2 += np.random.randn(*self.W2.shape).astype(np.float32) * 0.06
-        self.W3 += np.random.randn(*self.W3.shape).astype(np.float32) * 0.06
+        # Small exploratory variance across the population
+        self.W1 += np.random.randn(*self.W1.shape).astype(np.float32) * 0.05
+        self.W2 += np.random.randn(*self.W2.shape).astype(np.float32) * 0.05
+        self.W3 += np.random.randn(*self.W3.shape).astype(np.float32) * 0.05
 
         self.generation = 0
         self.last_hidden = np.zeros((pop_size, 16), dtype=np.float32)
@@ -232,7 +233,7 @@ class FastNeuroEvolution:
         elites_w3 = self.W3[ranks[:num_elites]].copy()
         elites_b3 = self.b3[ranks[:num_elites]].copy()
 
-        # Truncation selection: sample parents from top 10% with rank weighting
+        # Truncation selection from top 10%
         top_pool_size = max(num_elites, int(self.pop_size * 0.10))
         top_indices = ranks[:top_pool_size]
         weights = 1.0 / np.sqrt(np.arange(1, top_pool_size + 1))
@@ -247,9 +248,9 @@ class FastNeuroEvolution:
         new_W3 = self.W3[chosen].copy()
         new_b3 = self.b3[chosen].copy()
 
-        # Multi-scale mutations (60% fine, 30% medium, 10% coarse)
-        sigmas = np.random.choice([0.02, 0.08, 0.20], size=(self.pop_size, 1, 1), p=[0.60, 0.30, 0.10]).astype(np.float32)
-        p_mut = 0.18
+        # Multi-scale fine-tuning mutations (70% micro, 25% medium, 5% macro)
+        sigmas = np.random.choice([0.02, 0.06, 0.15], size=(self.pop_size, 1, 1), p=[0.70, 0.25, 0.05]).astype(np.float32)
+        p_mut = 0.15
 
         m1 = np.random.rand(*new_W1.shape) < p_mut
         new_W1 += (m1 * np.random.randn(*new_W1.shape)).astype(np.float32) * sigmas
@@ -263,7 +264,7 @@ class FastNeuroEvolution:
         new_W3 += (m3 * np.random.randn(*new_W3.shape)).astype(np.float32) * sigmas
         new_b3 += ((np.random.rand(*new_b3.shape) < p_mut) * np.random.randn(*new_b3.shape)).astype(np.float32) * sigmas.squeeze(-1)
 
-        # Preserve top champions untouched
+        # Strictly preserve top elites untouched
         new_W1[:num_elites] = elites_w1
         new_b1[:num_elites] = elites_b1
         new_W2[:num_elites] = elites_w2
@@ -283,36 +284,47 @@ class FastNeuroEvolution:
             obs, _ = envs.reset()
             fitness = np.zeros(self.pop_size, dtype=np.float32)
             alive = np.ones(self.pop_size, dtype=bool)
+            completed = np.zeros(self.pop_size, dtype=bool)
+            steps_to_goal = np.full(self.pop_size, rollout_steps, dtype=np.int32)
 
-            # Record initial distance to track true net progress
             init_dist = obs[:, 6].copy()
             min_dist = init_dist.copy()
 
-            for _ in range(rollout_steps):
+            for step_idx in range(rollout_steps):
                 act = self.forward(obs)
-                noise = np.random.randn(*act.shape).astype(np.float32) * 0.02
+                noise = np.random.randn(*act.shape).astype(np.float32) * 0.015
                 act_noisy = np.clip(act + noise, -1.0, 1.0)
 
                 obs, rewards, term, trunc, _ = envs.step(act_noisy)
 
-                # Only alive agents accumulate rewards
-                fitness += np.where(alive, rewards, 0.0)
+                # Record goal achievement
                 cur_dist = obs[:, 6]
+                reached = alive & (cur_dist < 1.8)
+                newly_completed = reached & (~completed)
+                completed |= reached
+                steps_to_goal = np.where(newly_completed, step_idx + 1, steps_to_goal)
+
+                fitness += np.where(alive, rewards, 0.0)
                 min_dist = np.where(alive & (cur_dist < min_dist), cur_dist, min_dist)
 
                 alive &= ~(term | trunc)
                 if not np.any(alive):
                     break
 
-            # Heavy bonus on true corridor progress (ending circle exploits)
+            # Distance-to-goal progress bonus
             net_progress = np.maximum(0.0, init_dist - min_dist)
-            fitness += net_progress * 45.0
+            fitness += net_progress * 80.0
+
+            # Huge reward for solving the maze + bonus for speed
+            finish_bonus = np.where(completed, 8000.0 + (rollout_steps - steps_to_goal) * 20.0, 0.0)
+            fitness += finish_bonus
 
             top_fit = float(np.max(fitness))
             min_rem_dist = float(np.min(min_dist))
+            num_solved = int(np.sum(completed))
 
             if verbose and (gen % 5 == 0 or gen == generations - 1):
-                print(f"   Gen {gen:02d}/{generations} | Top Fit: {top_fit:7.1f} | Closest to Goal: {min_rem_dist:4.1f} units")
+                print(f"   Gen {gen:02d}/{generations} | Top Fit: {top_fit:8.1f} | Closest: {min_rem_dist:4.1f}u | Solved: {num_solved:3d}/{self.pop_size}")
 
             self.evolve(fitness)
 
@@ -429,7 +441,7 @@ class CyberVisualizer:
         pygame.draw.rect(self.screen, (34, 197, 94), (235, self.arena_h + 56, gas_bar_w, 12))
         self.screen.blit(self.font_tiny.render(f"GAS   [{gas_val:.2f}]", True, (203, 213, 225)), (355, self.arena_h + 56))
 
-        # Jump indicator
+        # Jump thruster indicator
         is_firing = jump_val > 0.0
         jump_color = (192, 132, 252) if is_firing else (71, 85, 105)
         jump_state = "FIRING" if is_firing else "GROUND"
