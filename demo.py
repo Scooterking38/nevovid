@@ -682,7 +682,7 @@ def main():
     train_envs = CyberArenaCls(num_envs=args.pop_size, grid_map=maze)
     ga = FastNeuroEvolution(pop_size=args.pop_size, in_dim=14, out_dim=3)
 
-    elapsed, sps, top_fit = ga.train_epoch(train_envs, generations=args.generations, rollout_steps=340, verbose=True)
+    elapsed, sps, top_fit = ga.train_epoch(train_envs, generations=args.generations, rollout_steps=600, verbose=True)
     print(f"\n   Done in {elapsed:.2f}s! ({sps:,.0f} agent-steps/sec)")
     print(f"   Champion Fitness: {top_fit:.1f}")
 
