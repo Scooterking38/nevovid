@@ -25,22 +25,22 @@ class CyberCourse3D:
     def __init__(self):
         # Track width is 4.0m (centered at X = 0, bounds: X in [-2.0, +2.0])
         self.width = 4.0
-        self.start_pos = np.array([0.0, 0.9, 1.0], dtype=np.float32)
-        self.goal_pos = np.array([0.0, 3.4, 32.0], dtype=np.float32)
+        self.start_pos = np.array([0.0, 0.88, 1.0], dtype=np.float32)
+        self.goal_pos = np.array([0.0, 3.40, 32.0], dtype=np.float32)
 
         # Obstacle Locations
-        self.laser_z = 6.0       # Laser hurdle at Z = 6.0m
-        self.ramp_start_z = 10.0 # Ramp climbs Z = 10.0 -> 18.0m (Y: 0.5 -> 3.0m)
-        self.chasm_start_z = 18.0# Takeoff kicker at Z = 18.0m
-        self.chasm_end_z = 22.5  # Receiving deck across 4.5m chasm!
-        self.track_end_z = 35.0  # Summit Goal Deck
+        self.laser_z = 6.0        # Laser hurdle at Z = 6.0m (Height: 0.5m -> 1.1m)
+        self.ramp_start_z = 10.0  # Ramp climbs Z = 10.0 -> 18.0m (Y: 0.5 -> 3.0m)
+        self.chasm_start_z = 18.0 # Takeoff lip at Z = 18.0m
+        self.chasm_end_z = 22.5   # Receiving deck across 4.5m chasm!
+        self.track_end_z = 35.0   # Summit Goal Deck
 
     def get_track_surface(self, x: float, z: float) -> Tuple[float, float, bool]:
         """
         Returns (surface_y, slope_angle_rad, is_in_chasm).
         """
         # Off-track check (fell off the left/right sides)
-        if abs(x) > (self.width / 2.0 + 0.3):
+        if abs(x) > (self.width / 2.0 + 0.35):
             return -999.0, 0.0, True
 
         # Zone 1: Ground Runway (Z: 0.0 -> 10.0m)
@@ -52,10 +52,9 @@ class CyberCourse3D:
             t = (z - self.ramp_start_z) / (self.chasm_start_z - self.ramp_start_z)
             y = 0.5 + t * 2.5
             slope = math.atan2(2.5, 8.0)
-            # Add an upward kicker curve right at the takeoff lip (Z: 17.0 -> 18.0)
             if z > 17.0:
-                y += (z - 17.0) * 0.25
-                slope += 0.15
+                y += (z - 17.0) * 0.22
+                slope += 0.12
             return y, slope, False
 
         # Zone 3: The 3D Chasm Gap (Z: 18.0 -> 22.5m, 4.5m of empty air!)
@@ -108,10 +107,10 @@ class Fast3DMarbleEngine:
         actions: [N, 3] -> act[0]=steer_x, act[1]=throttle_z, act[2]=jump_thruster (>0.0)
         """
         dt = 1.0 / 60.0
-        gravity = 14.5  # m/s^2
+        gravity = 14.0  # m/s^2
 
         steer_x = np.clip(actions[:, 0], -1.0, 1.0)
-        throttle_z = np.clip(0.45 + 0.55 * actions[:, 1], 0.45, 1.0)  # Always committed forward drive
+        throttle_z = np.clip(0.45 + 0.55 * actions[:, 1], 0.45, 1.0)
         wants_jump = actions[:, 2] > 0.0
 
         # Lateral and Longitudinal Acceleration
@@ -123,7 +122,7 @@ class Fast3DMarbleEngine:
         self.vel[:, 0] *= 0.965
         self.vel[:, 2] *= 0.990
 
-        # Jump Launch: Vertical Impulse (v_y = 6.8 m/s -> launches 1.6m high, flies 7.8m horizontally)
+        # Jump Launch: Vertical Impulse (v_y = 6.8 m/s -> launches 1.65m high, flies 7.8m horizontally)
         can_jump = self.grounded & wants_jump
         self.vel[:, 1] = np.where(can_jump, 6.8, self.vel[:, 1] - gravity * dt)
 
@@ -149,17 +148,17 @@ class Fast3DMarbleEngine:
                 self.crashed[i] = True
 
         # -------------------------------------------------------------
-        # OBSTACLE 1: LASER HURDLE (Z = 6.0m, Height Y: 0.5 -> 1.2m)
+        # OBSTACLE 1: LASER HURDLE (Z = 6.0m, Height Y: 0.5 -> 1.1m)
         # -------------------------------------------------------------
         near_laser = np.abs(cand_z - self.course.laser_z) < 0.45
-        at_laser_height = cand_y < 1.35
+        at_laser_height = cand_y < 1.30
         hit_laser = near_laser & at_laser_height & (~self.crashed)
 
-        # Hitting laser repels and penalizes
+        # Hitting laser bounces back
         self.vel[hit_laser, 2] = -4.0
 
         # Successfully jumping over the laser hurdle
-        cleared_hurdle_now = near_laser & (cand_y >= 1.35) & (~self.cleared_hurdle)
+        cleared_hurdle_now = near_laser & (cand_y >= 1.30) & (~self.cleared_hurdle)
         self.cleared_hurdle |= cleared_hurdle_now
 
         # -------------------------------------------------------------
@@ -182,17 +181,17 @@ class Fast3DMarbleEngine:
         self.steps += 1
 
         # -------------------------------------------------------------
-        # REWARD SHAPING: FORCES THE BOT TO JUMP & USE ENVIRONMENT
+        # REWARD SHAPING: REWARDS JUMPING & ENVIRONMENT MASTER
         # -------------------------------------------------------------
-        fwd_reward = self.vel[:, 2] * 12.0
-        center_penalty = -np.abs(self.pos[:, 0]) * 3.0  # Penalty for wandering off centerline
+        fwd_reward = self.vel[:, 2] * 14.0
+        center_penalty = -np.abs(self.pos[:, 0]) * 3.0
 
-        # Big Stage-Clearance Bounties:
-        laser_bounty = np.where(cleared_hurdle_now, 2000.0, 0.0)
+        # Stage Clearance Bounties:
+        laser_bounty = np.where(cleared_hurdle_now, 2500.0, 0.0)
         laser_tax = np.where(hit_laser, 120.0, 0.0)
 
-        chasm_bounty = np.where(cleared_chasm_now, 4000.0, 0.0)
-        goal_bounty = np.where(reached_now, 10000.0, 0.0)
+        chasm_bounty = np.where(cleared_chasm_now, 4500.0, 0.0)
+        goal_bounty = np.where(reached_now, 12000.0, 0.0)
         crash_tax = np.where(self.crashed, 150.0, 0.0)
 
         rewards = fwd_reward + center_penalty + laser_bounty - laser_tax + chasm_bounty + goal_bounty - crash_tax
@@ -204,22 +203,25 @@ class Fast3DMarbleEngine:
     def get_observations(self) -> np.ndarray:
         """
         12-Dim State Observation:
-        - [0]: Lane offset X / 2.0 (-1=left edge, +1=right edge)
+        - [0]: Lane offset X / 2.0
         - [1]: Elevation Y / 4.0
-        - [2]: Progress along track Z / 35.0
+        - [2]: Track Progress Z / 35.0
         - [3..5]: Velocities (v_x, v_y, v_z)
         - [6]: Grounded flag
-        - [7]: Distance to Laser Hurdle (activates within 3m of laser!)
-        - [8]: Distance to Chasm Takeoff (activates within 3m of ramp edge!)
+        - [7]: Proximity trigger to Laser Hurdle (activates directly before laser: 4.5m -> 5.8m!)
+        - [8]: Proximity trigger to Chasm Takeoff (activates directly before chasm: 16.5m -> 17.8m!)
         - [9..11]: 3D Direction to Goal Beacon
         """
         to_goal = self.course.goal_pos[None, :] - self.pos
         dist_goal = np.linalg.norm(to_goal, axis=-1, keepdims=True)
         dir_goal = to_goal / (dist_goal + 1e-6)
 
-        # Proximity Sensors: trigger directly before obstacles
-        dist_to_laser = np.clip((self.course.laser_z - self.pos[:, 2]) / 3.0, -1.0, 1.0)
-        dist_to_chasm = np.clip((self.course.chasm_start_z - self.pos[:, 2]) / 3.0, -1.0, 1.0)
+        # Proximity Sensors: Spikes to +1.0 directly in the takeoff window before obstacles
+        dist_to_laser = self.course.laser_z - self.pos[:, 2]
+        laser_prox = np.clip(1.0 - np.abs(dist_to_laser - 0.75) / 1.1, 0.0, 1.0)
+
+        dist_to_chasm = self.course.chasm_start_z - self.pos[:, 2]
+        chasm_prox = np.clip(1.0 - np.abs(dist_to_chasm - 0.75) / 1.1, 0.0, 1.0)
 
         obs = np.column_stack([
             self.pos[:, 0] / 2.0,                     # 0: Lane offset X
@@ -229,8 +231,8 @@ class Fast3DMarbleEngine:
             self.vel[:, 1] * 0.1,                     # 4: Vel Y (Vertical)
             self.vel[:, 2] * 0.1,                     # 5: Vel Z (Forward Speed)
             self.grounded.astype(np.float32),         # 6: Grounded Flag
-            dist_to_laser,                            # 7: Proximity to Laser Hurdle
-            dist_to_chasm,                            # 8: Proximity to Chasm Takeoff
+            laser_prox,                               # 7: Proximity to Laser Hurdle
+            chasm_prox,                               # 8: Proximity to Chasm Takeoff
             dir_goal[:, 0], dir_goal[:, 1], dir_goal[:, 2]  # 9..11: 3D Goal Unit Vector
         ]).astype(np.float32)
 
@@ -267,20 +269,19 @@ class Fast3DMarblePolicy:
         self.mW2[0, 0] = 1.8
         self.mW3[0, 0] = 1.5
 
-        # 2. Full forward speed commitment
-        self.mW1[5, 1] = 1.2     # Vel Z
+        # 2. Forward speed commitment
+        self.mW1[5, 1] = 1.4     # Vel Z
         self.mb1[1] = 0.8
         self.mW2[1, 1] = 1.5
         self.mW3[1, 1] = 1.4
         self.mb3[1] = 1.2        # Maximum forward roll drive
 
         # 3. Dedicated Jump-Timing Trigger Neurons
-        # Trigger jump when approaching Laser Hurdle (sensor 7: 0.1 < dist < 0.6)
-        self.mW1[7, 2] = -2.8    # dist_to_laser approaching 0 -> JUMP!
-        # Trigger jump when approaching Chasm Takeoff (sensor 8: 0.1 < dist < 0.6)
-        self.mW1[8, 2] = -3.2    # dist_to_chasm approaching 0 -> LAUNCH CHASM!
-        self.mW1[6, 2] = 1.4     # Grounded flag
-        self.mb1[2] = 0.2
+        # Trigger jump when laser proximity (sensor 7) or chasm proximity (sensor 8) activates!
+        self.mW1[7, 2] = 3.2     # laser_prox spikes -> JUMP!
+        self.mW1[8, 2] = 3.6     # chasm_prox spikes -> LAUNCH CHASM!
+        self.mW1[6, 2] = 1.0     # Grounded flag
+        self.mb1[2] = -0.5       # Default grounded when not near obstacles
         self.mW2[2, 2] = 2.0
         self.mW3[2, 2] = 1.8
         self.mb3[2] = 0.1        # Active jump exploration bias
@@ -454,7 +455,7 @@ class CyberMarbleVisualizer:
         pr.init_window(self.screen_w, self.screen_h, "CyberMarble 3D: Autonomous Jumping AI Course")
         pr.set_target_fps(60)
 
-        # Camera modes: 0 = 3D Chase Cam, 1 = 3D Side Stunt Angle, 2 = 3D Aerial Orbit
+        # Camera modes: 0 = 3D Chase Cam, 1 = 3D Stunt Side Angle, 2 = 3D Aerial Overview
         self.cam_mode = 0
         self.cam_smoothed = [course.start_pos[0] - 4.5, 3.2, course.start_pos[2] - 5.0]
 
@@ -484,7 +485,7 @@ class CyberMarbleVisualizer:
         hurdle_center = pr.Vector3(0.0, 0.85, 6.0)
         pr.draw_cylinder_wires(pr.Vector3(-2.1, 0.25, 6.0), 0.2, 0.2, 1.6, 8, pr.RED)
         pr.draw_cylinder_wires(pr.Vector3(2.1, 0.25, 6.0), 0.2, 0.2, 1.6, 8, pr.RED)
-        # Laser beam
+        # Pulsing laser beam
         pulse = abs(math.sin(time.time() * 8.0)) * 0.1
         pr.draw_cube(hurdle_center, 4.2, 0.4 + pulse, 0.15, pr.Color(255, 30, 80, 220))
         pr.draw_cube_wires(hurdle_center, 4.2, 0.4 + pulse, 0.15, pr.Color(255, 150, 180, 255))
@@ -507,7 +508,6 @@ class CyberMarbleVisualizer:
         pr.draw_cube_wires(kicker_pos, 4.0, 0.35, 0.5, pr.YELLOW)
 
         # 4. The Chasm Gap (Z: 18.0 -> 22.5m)
-        # Deep abyss hazard grid below
         pr.draw_plane(pr.Vector3(0.0, -1.0, 20.25), pr.Vector2(10.0, 4.5), pr.Color(6, 10, 20, 255))
         pr.draw_line_3d(pr.Vector3(-2.2, 3.0, 18.0), pr.Vector3(-2.2, -1.0, 18.0), pr.RED)
         pr.draw_line_3d(pr.Vector3(2.2, 3.0, 18.0), pr.Vector3(2.2, -1.0, 18.0), pr.RED)
@@ -541,7 +541,7 @@ class CyberMarbleVisualizer:
         pr.draw_sphere(center, self.engine.radius, ball_c)
         pr.draw_sphere_wires(center, self.engine.radius, 10, 10, pr.WHITE)
 
-        # 2. Dual Rolling Gyro-Rings (rotate as the ball rolls!)
+        # 2. Dual Rolling Gyro-Rings
         pr.draw_circle_3d(center, self.engine.radius + 0.05, pr.Vector3(1, 0, 0), math.degrees(self.ball_roll), pr.Color(255, 220, 50, 240))
         pr.draw_circle_3d(center, self.engine.radius + 0.05, pr.Vector3(0, 0, 1), 0.0, pr.Color(255, 60, 140, 200))
 
@@ -662,14 +662,12 @@ class CyberMarbleVisualizer:
             pr.draw_rectangle_lines(25, 25, 120, 200, pr.Color(0, 220, 255, 255))
             scale_z = 200.0 / 35.0
 
-            # Track outline in PiP
             pr.draw_rectangle(75, int(25 + 0 * scale_z), 20, int(10 * scale_z), pr.Color(45, 65, 105, 255))
             pr.draw_line(65, int(25 + 6.0 * scale_z), 105, int(25 + 6.0 * scale_z), pr.RED)  # Laser
             pr.draw_rectangle(75, int(25 + 10 * scale_z), 20, int(8 * scale_z), pr.Color(45, 65, 105, 255))
             pr.draw_rectangle(75, int(25 + 22.5 * scale_z), 20, int(12.5 * scale_z), pr.Color(45, 65, 105, 255))
             pr.draw_circle(85, int(25 + 32.0 * scale_z), 5, pr.GREEN)  # Goal
 
-            # Ball dot in PiP
             ball_pip_y = int(25 + c_pos[2] * scale_z)
             ball_pip_x = int(85 + (c_pos[0] / 2.0) * 15.0)
             pr.draw_circle(ball_pip_x, ball_pip_y, 4, pr.Color(0, 245, 255, 255))
@@ -759,12 +757,14 @@ class CyberMarbleVisualizer:
             pr.end_drawing()
 
             # -------------------------------------------------------------
-            # RECORD VIDEO (DO NOT FLIP VERTICAL - STAYS RIGHT-SIDE UP!)
+            # RECORD VIDEO (FLIPPED VERTICALLY FOR TRUE UPRIGHT ORIENTATION)
             # -------------------------------------------------------------
             if video_writer is not None:
                 img = pr.load_image_from_screen()
                 buf = pr.ffi.buffer(img.data, img.width * img.height * 4)
-                frame = np.frombuffer(buf, dtype=np.uint8).reshape((img.height, img.width, 4))[:, :, :3]
+                raw_frame = np.frombuffer(buf, dtype=np.uint8).reshape((img.height, img.width, 4))[:, :, :3]
+                # Flip vertically to match video player raster order
+                frame = np.flipud(raw_frame)
                 video_writer.append_data(frame)
                 pr.unload_image(img)
 
