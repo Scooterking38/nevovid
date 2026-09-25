@@ -48,10 +48,8 @@ jobs:
           
           # xvfb-run provides the virtual OpenGL/GLX display buffer for camera rendering
           xvfb-run -a -s "-screen 0 1920x1080x24" python demo.py \
-            --headless \
             --video cyber_arena_bullet3d.mp4 \
-            --frames "$FRAMES" \
-            --generations "$GENS"
+            --frames "$FRAMES" 
 
       - name: Upload 3D Simulation Video
         uses: actions/upload-artifact@v4
