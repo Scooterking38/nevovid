@@ -11,7 +11,6 @@ import numpy as np
 
 try:
     import mujoco
-    import mujoco.viewer
 except ImportError:
     print("\n[!] 'mujoco' is not installed.")
     print("    Please install it using: pip install mujoco\n")
@@ -30,7 +29,7 @@ MJCF_ARENA = """
   <option gravity="0 0 -14.0" timestep="0.016666"/>
 
   <visual>
-    <headlight diffuse="0.8 0.8 0.8" ambient="0.25 0.25 0.35" specular="0.6 0.6 0.6"/>
+    <headlight diffuse="0.85 0.85 0.85" ambient="0.3 0.3 0.4" specular="0.6 0.6 0.6"/>
     <rgba fog="0.05 0.07 0.14 1"/>
     <quality shadowsize="2048"/>
     <global elevation="-22" azimuth="90"/>
@@ -67,13 +66,11 @@ MJCF_ARENA = """
     <geom name="runway" type="box" size="2.0 5.0 0.2" pos="0 5.0 0.2" material="track_mat"/>
 
     <!-- OBSTACLE 1: High-Voltage Laser Barrier (at Y = 6.0m, Height Z: 0.4 -> 1.05m) -->
-    <!-- Solid obstacle: Rolling crashes, jumping clears it! -->
     <geom name="laser_barrier" type="box" size="2.1 0.08 0.32" pos="0 6.0 0.72" material="neon_pink"/>
     <geom name="laser_post_l" type="cylinder" size="0.12 0.6" pos="-2.1 6.0 0.6" material="neon_pink"/>
     <geom name="laser_post_r" type="cylinder" size="0.12 0.6" pos="2.1 6.0 0.6" material="neon_pink"/>
 
     <!-- STAGE 2: Seamless Ascending Launch Ramp (Y: 10 -> 18m, Climbs Z: 0.4 -> 2.4m) -->
-    <!-- Inclined by 14.036 degrees around X axis -->
     <geom name="ramp" type="box" size="2.0 4.123 0.15" pos="0 14.0 1.40" euler="14.036 0 0" material="ramp_mat"/>
 
     <!-- Underpass Tunnel: Open path underneath the bridge at Y=14, Z=0 -->
@@ -82,7 +79,6 @@ MJCF_ARENA = """
     <!-- STAGE 3: THE VOID CHASM (Y: 18 -> 22.5m, 4.5m gap of empty space!) -->
 
     <!-- STAGE 4: Suspended Sky-Deck (Y: 22.5 -> 34m, Elevated at Z = 2.4m) -->
-    <!-- Spans OVER the lower world: Impossible to go through underside! -->
     <geom name="sky_deck" type="box" size="2.2 5.75 0.15" pos="0 28.25 2.25" material="deck_mat"/>
     <geom name="sky_pillar_l" type="cylinder" size="0.25 1.2" pos="-2.0 28.25 1.2" material="pillar_mat"/>
     <geom name="sky_pillar_r" type="cylinder" size="0.25 1.2" pos="2.0 28.25 1.2" material="pillar_mat"/>
@@ -139,7 +135,6 @@ class CyberMarbleEnv:
         vel = self.data.qvel[0:3]
         ang_vel = self.data.qvel[3:6]
 
-        # 3D Vector pointing to Goal Beacon
         to_goal = self.goal_pos - pos
         dist_goal = np.linalg.norm(to_goal)
         u_goal = to_goal / (dist_goal + 1e-6)
@@ -151,7 +146,6 @@ class CyberMarbleEnv:
         dist_chasm = 18.0 - pos[1]
         chasm_sensor = np.clip(1.0 - abs(dist_chasm - 0.75) / 1.1, 0.0, 1.0)
 
-        # Ground contact check from MuJoCo contact manifold
         grounded = 1.0 if self.data.ncon > 0 and pos[2] > 0.0 else 0.0
 
         obs = np.array([
@@ -172,9 +166,6 @@ class CyberMarbleEnv:
         return obs
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool]:
-        """
-        action: [steer, throttle, jump]
-        """
         steer = float(np.clip(action[0], -1.0, 1.0))
         throttle = float(np.clip(0.50 + 0.50 * action[1], 0.40, 1.0))
         jump = bool(action[2] > 0.0)
@@ -182,8 +173,6 @@ class CyberMarbleEnv:
         pos_before = self.data.qpos[0:3].copy()
 
         # Apply continuous rolling torque in MuJoCo generalized coordinates
-        # Torque around X rolls forward (+Y)
-        # Force along X steers laterally
         self.data.qfrc_applied[:] = 0.0
         self.data.qfrc_applied[3] = -throttle * 14.0  # Forward rolling drive
         self.data.qfrc_applied[0] = steer * 18.0      # Lateral steer
@@ -199,14 +188,10 @@ class CyberMarbleEnv:
         pos_after = self.data.qpos[0:3]
         vel = self.data.qvel[0:3]
 
-        # -------------------------------------------------------------
-        # STAGE CLEARANCE DETECTION & REWARD SHAPING
-        # -------------------------------------------------------------
-        # 1. Forward velocity progress
         fwd_rew = vel[1] * 12.0
         center_pen = -abs(pos_after[0]) * 3.0
 
-        # 2. Hurdle Jump Detection (Y crosses 6.0 while Z >= 1.15m)
+        # Hurdle Jump Detection (Y crosses 6.0 while Z >= 1.15m)
         cleared_hurdle_now = (pos_before[1] < 6.0 <= pos_after[1]) and (pos_after[2] >= 1.15)
         if cleared_hurdle_now:
             self.cleared_hurdle = True
@@ -222,20 +207,19 @@ class CyberMarbleEnv:
                 break
         laser_tax = 120.0 if hit_laser else 0.0
 
-        # 3. Chasm Gap Clearance (Y crosses 22.5 while Z >= 2.3m)
+        # Chasm Gap Clearance (Y crosses 22.5 while Z >= 2.3m)
         cleared_chasm_now = (pos_before[1] < 22.5 <= pos_after[1]) and (pos_after[2] >= 2.3)
         if cleared_chasm_now:
             self.cleared_chasm = True
         chasm_bounty = 5000.0 if cleared_chasm_now else 0.0
 
-        # 4. Summit Goal Reached
+        # Summit Goal Reached
         to_goal = np.linalg.norm(self.goal_pos - pos_after)
         reached_goal_now = (to_goal < 2.0) and (pos_after[2] >= 2.3)
         if reached_goal_now:
             self.reached_goal = True
         goal_bounty = 12000.0 if reached_goal_now else 0.0
 
-        # 5. Fell into Abyss
         fell_in_void = pos_after[2] < -1.5
         fall_tax = 150.0 if fell_in_void else 0.0
 
@@ -262,7 +246,7 @@ class Fast3DPolicy:
         self.mW3 = np.random.randn(16, out_dim).astype(np.float32) * 0.02
         self.mb3 = np.zeros(out_dim, dtype=np.float32)
 
-        # Inductive Jump & Steering Prior Wiring
+        # Steering & Speed Prior
         self.mW1[0, 0] = -2.5    # Centerline tracking: offset X steers back to 0
         self.mW2[0, 0] = 1.8
         self.mW3[0, 0] = 1.5
@@ -382,188 +366,71 @@ class Fast3DPolicy:
 
 
 # =====================================================================
-# 4. HD RAYLIB 3D STUNT RENDERER & RIGHT-SIDE-UP VIDEO RECORDER
+# 4. NATIVE MUJOCO 3D RENDERER & HD VIDEO EXPORTER
 # =====================================================================
 class MuJoCoStudioVisualizer:
     def __init__(self, env: CyberMarbleEnv, policy: Fast3DPolicy):
         self.env = env
         self.policy = policy
+        self.width = 1280
+        self.height = 720
+        self.renderer = mujoco.Renderer(env.model, height=self.height, width=self.width)
 
-        self.screen_w = 1600
-        self.screen_h = 920
-        self.hud_h = 120
-        self.viewport_h = self.screen_h - self.hud_h
-
-        pr.set_config_flags(pr.FLAG_MSAA_4X_HINT | pr.FLAG_WINDOW_HIGHDPI | pr.FLAG_VSYNC_HINT)
-        pr.init_window(self.screen_w, self.screen_h, "CyberMarble 3D: DeepMind MuJoCo Engine")
-        pr.set_target_fps(60)
-
-        # Chase Camera (Y is FORWARD, Z is UP in MuJoCo coordinate frame!)
-        self.cam_smoothed = [0.0, -3.5, 2.5]
-        self.camera = pr.Camera3D(
-            pr.Vector3(0.0, -3.5, 2.5),
-            pr.Vector3(0.0, 3.0, 0.8),
-            pr.Vector3(0.0, 0.0, 1.0),  # +Z is UP
-            54.0,
-            pr.CAMERA_PERSPECTIVE
-        )
-
-        self.ribbons: List[List[float]] = []
-        self.paused = False
+        # 3D Smooth Chase Camera
+        self.camera = mujoco.MjvCamera()
+        self.camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+        self.camera.trackbodyid = env.model.body("marble").id
+        self.camera.distance = 5.2
+        self.camera.elevation = -22.0
+        self.camera.azimuth = 90.0
 
     def run(self, video_path: Optional[str] = None, max_frames: Optional[int] = None):
-        video_writer = None
         if video_path:
             import imageio
-            print(f"[*] Recording 60 FPS HD 3D Video to: {video_path}")
+            print(f"[*] Recording 60 FPS HD 3D Video via MuJoCo Native Renderer to: {video_path}")
             video_writer = imageio.get_writer(video_path, fps=60, codec="libx264", quality=8)
 
-        frame_count = 0
-        obs = self.env.reset()
+            obs = self.env.reset()
+            frame_count = 0
+            limit = max_frames if max_frames else 600
 
-        while not pr.window_should_close():
-            if max_frames is not None and frame_count >= max_frames:
-                break
-
-            if pr.is_key_pressed(pr.KEY_SPACE):
-                self.paused = not self.paused
-            elif pr.is_key_pressed(pr.KEY_R):
-                obs = self.env.reset()
-
-            if not self.paused:
+            while frame_count < limit:
                 action = self.policy.forward(obs)
                 obs, rew, done = self.env.step(action)
                 if done:
-                    time.sleep(0.3)
                     obs = self.env.reset()
 
-            pos = self.env.data.qpos[0:3]
-            vel = self.env.data.qvel[0:3]
-            speed = float(np.linalg.norm(vel))
+                # Render 3D Frame directly from MuJoCo
+                self.renderer.update_scene(self.env.data, camera=self.camera)
+                pixels = self.renderer.render()
+                video_writer.append_data(pixels)
+                frame_count += 1
 
-            # Record trajectory ribbon
-            self.ribbons.append([pos[0], pos[1], pos[2], 1.0])
-            if len(self.ribbons) > 80:
-                self.ribbons.pop(0)
-
-            # Smooth 3D Chase Camera (+Z is UP)
-            target_cx = pos[0]
-            target_cy = pos[1] - 4.8
-            target_cz = max(1.8, pos[2] + 1.8)
-
-            self.cam_smoothed[0] += (target_cx - self.cam_smoothed[0]) * 0.22
-            self.cam_smoothed[1] += (target_cy - self.cam_smoothed[1]) * 0.22
-            self.cam_smoothed[2] += (target_cz - self.cam_smoothed[2]) * 0.22
-
-            self.camera.position = pr.Vector3(float(self.cam_smoothed[0]), float(self.cam_smoothed[1]), float(self.cam_smoothed[2]))
-            self.camera.target = pr.Vector3(float(pos[0]), float(pos[1] + 2.5), float(pos[2] + 0.3))
-            self.camera.up = pr.Vector3(0.0, 0.0, 1.0)
-
-            # -------------------------------------------------------------
-            # 3D HARDWARE RENDERING
-            # -------------------------------------------------------------
-            pr.begin_drawing()
-            pr.clear_background(pr.Color(12, 16, 28, 255))
-
-            pr.begin_mode_3d(self.camera)
-
-            # Ground Runway (Y: 0 -> 10m, Z = 0.2m)
-            pr.draw_cube(pr.Vector3(0.0, 5.0, 0.2), 4.0, 10.0, 0.4, pr.Color(24, 34, 58, 255))
-            pr.draw_cube_wires(pr.Vector3(0.0, 5.0, 0.2), 4.0, 10.0, 0.4, pr.Color(0, 220, 255, 255))
-
-            # Obstacle 1: Glowing Pink Laser Barrier (Y = 6.0m)
-            pr.draw_cube(pr.Vector3(0.0, 6.0, 0.72), 4.2, 0.16, 0.64, pr.Color(255, 20, 80, 220))
-            pr.draw_cube_wires(pr.Vector3(0.0, 6.0, 0.72), 4.2, 0.16, 0.64, pr.Color(255, 120, 180, 255))
-
-            # Stage 2: Ascending Ramp (Y: 10 -> 18m, Climbs Z: 0.4 -> 2.4m)
-            # Center: Y = 14.0, Z = 1.4
-            pr.draw_cube(pr.Vector3(0.0, 14.0, 1.40), 4.0, 8.24, 0.30, pr.Color(30, 48, 85, 255))
-            pr.draw_cube_wires(pr.Vector3(0.0, 14.0, 1.40), 4.0, 8.24, 0.30, pr.Color(0, 240, 255, 255))
-
-            # Underpass Road crossing at Y=14, Z=-0.1
-            pr.draw_cube(pr.Vector3(0.0, 14.0, -0.1), 8.0, 4.0, 0.2, pr.Color(18, 26, 46, 255))
-
-            # Chasm Void (Y: 18 -> 22.5m)
-            pr.draw_plane(pr.Vector3(0.0, 20.25, -2.5), pr.Vector2(10.0, 4.5), pr.Color(6, 10, 20, 255))
-
-            # Stage 4: Suspended Sky-Deck (Y: 22.5 -> 34m, Z = 2.25)
-            pr.draw_cube(pr.Vector3(0.0, 28.25, 2.25), 4.4, 11.5, 0.30, pr.Color(20, 36, 68, 255))
-            pr.draw_cube_wires(pr.Vector3(0.0, 28.25, 2.25), 4.4, 11.5, 0.30, pr.Color(0, 255, 180, 255))
-
-            # Stage 5: Summit Goal Beacon
-            pr.draw_cylinder(pr.Vector3(0.0, 32.5, 2.4), 0.5, 0.5, 5.0, 16, pr.Color(0, 255, 128, 190))
-            pr.draw_sphere(pr.Vector3(0.0, 32.5, 7.6), 0.7, pr.Color(255, 220, 50, 255))
-            pr.draw_sphere_wires(pr.Vector3(0.0, 32.5, 7.6), 0.75, 8, 8, pr.WHITE)
-
-            # 3D Trajectory Ribbon Trail
-            for r in self.ribbons:
-                pr.draw_sphere(pr.Vector3(float(r[0]), float(r[1]), float(r[2])), 0.12, pr.Color(220, 80, 255, 220))
-
-            # Champion AI Cyber-Marble (Cyan Core + Rolling Gyro-Ring)
-            ball_p = pr.Vector3(float(pos[0]), float(pos[1]), float(pos[2]))
-            ball_color = pr.Color(0, 245, 255, 255) if self.env.data.ncon > 0 else pr.Color(230, 90, 255, 255)
-            pr.draw_sphere(ball_p, 0.38, ball_color)
-            pr.draw_sphere_wires(ball_p, 0.38, 12, 12, pr.WHITE)
-
-            # Rocket Thruster Flame when Airborne
-            if pos[2] > 0.6 and self.env.data.ncon == 0:
-                pr.draw_sphere(pr.Vector3(float(pos[0]), float(pos[1]) - 0.35, float(pos[2]) - 0.35), 0.22, pr.ORANGE)
-                pr.draw_sphere(pr.Vector3(float(pos[0]), float(pos[1]) - 0.35, float(pos[2]) - 0.35), 0.12, pr.YELLOW)
-
-            pr.end_mode_3d()
-
-            # -------------------------------------------------------------
-            # 2D HUD OVERLAYS
-            # -------------------------------------------------------------
-            hud_y = self.viewport_h
-            pr.draw_rectangle(0, hud_y, self.screen_w, self.hud_h, pr.Color(14, 20, 36, 255))
-            pr.draw_line(0, hud_y, self.screen_w, hud_y, pr.Color(0, 220, 255, 255))
-
-            dist_beacon = float(np.linalg.norm(pos - self.env.goal_pos))
-            pr.draw_text(f"GEN {self.policy.generation:03d} [DeepMind MuJoCo]", 30, hud_y + 16, 26, pr.Color(0, 220, 255, 255))
-            pr.draw_text(f"FORWARD SPEED : {speed * 3.6:4.1f} km/h", 30, hud_y + 48, 18, pr.WHITE)
-            pr.draw_text(f"ELEVATION Z   : {pos[2]:4.2f} m", 30, hud_y + 70, 18, pr.Color(230, 140, 255, 255))
-            pr.draw_text(f"DIST TO BEACON: {dist_beacon:4.1f} m", 30, hud_y + 92, 18, pr.LIME)
-
-            # Telemetry Milestones
-            pr.draw_line(420, hud_y + 12, 420, hud_y + 110, pr.Color(45, 65, 100, 255))
-            pr.draw_text("STAGE CLEARANCES", 445, hud_y + 16, 20, pr.Color(200, 225, 255, 255))
-
-            h_col = pr.LIME if self.env.cleared_hurdle else pr.YELLOW
-            pr.draw_text("1. LASER HURDLE : [CLEARED]" if self.env.cleared_hurdle else "1. LASER HURDLE : [PENDING]", 445, hud_y + 44, 15, h_col)
-
-            c_col = pr.LIME if self.env.cleared_chasm else pr.YELLOW
-            pr.draw_text("2. CHASM 4.5m   : [CLEARED]" if self.env.cleared_chasm else "2. CHASM 4.5m   : [PENDING]", 445, hud_y + 66, 15, c_col)
-
-            g_col = pr.LIME if self.env.reached_goal else pr.SKYBLUE
-            pr.draw_text("3. SUMMIT BEACON: [VICTORY]" if self.env.reached_goal else "3. SUMMIT BEACON: [RACING]", 445, hud_y + 88, 15, g_col)
-
-            # Actuators
-            pr.draw_line(820, hud_y + 12, 820, hud_y + 110, pr.Color(45, 65, 100, 255))
-            pr.draw_text("AI 3D MOTORS", 845, hud_y + 16, 20, pr.Color(200, 225, 255, 255))
-            pr.draw_text(f"TORQUE X: {float(action[0]):+.2f} | TORQUE Y: {float(action[1]):.2f}", 845, hud_y + 48, 16, pr.WHITE)
-
-            thruster_on = bool(action[2] > 0.0)
-            t_col = pr.Color(230, 140, 255, 255) if thruster_on else pr.GRAY
-            pr.draw_text("VERTICAL ROCKET THRUSTER: [ACTIVE]" if thruster_on else "VERTICAL ROCKET THRUSTER: [OFF]", 845, hud_y + 74, 16, t_col)
-
-            pr.end_drawing()
-
-            # Record Video: Native top-down orientation (Right-side up)
-            if video_writer is not None:
-                img = pr.load_image_from_screen()
-                buf = pr.ffi.buffer(img.data, img.width * img.height * 4)
-                frame = np.frombuffer(buf, dtype=np.uint8).reshape((img.height, img.width, 4))[:, :, :3]
-                video_writer.append_data(frame)
-                pr.unload_image(img)
-
-            frame_count += 1
-
-        if video_writer is not None:
             video_writer.close()
             print(f"[+] 3D MP4 Video successfully saved to: {video_path} ({frame_count} frames)")
 
-        pr.close_window()
+        else:
+            # Interactive Desktop Viewer
+            try:
+                import mujoco.viewer
+                print("[*] Launching MuJoCo Interactive Desktop Viewer...")
+                with mujoco.viewer.launch_passive(self.env.model, self.env.data) as viewer:
+                    obs = self.env.reset()
+                    while viewer.is_running():
+                        step_start = time.time()
+                        action = self.policy.forward(obs)
+                        obs, rew, done = self.env.step(action)
+                        if done:
+                            time.sleep(0.3)
+                            obs = self.env.reset()
+
+                        viewer.sync()
+                        elapsed = time.time() - step_start
+                        if elapsed < 0.0166:
+                            time.sleep(0.0166 - elapsed)
+            except Exception as e:
+                print(f"[!] Could not launch interactive GUI viewer: {e}")
+                print("    You can still generate videos using: python demo.py --video output.mp4")
 
 
 # =====================================================================
@@ -594,12 +461,9 @@ def main():
     elapsed, top_fit = policy.train_es(env, generations=args.generations, pop_size=64, rollout_steps=320, verbose=True)
     print(f"\n   Training Finished in {elapsed:.2f}s! Top Fitness: {top_fit:.1f}")
 
-    print("\n3. Launching Studio-Grade 3D Engine...")
-    print("   Controls: [SPACE] Pause | [R] Reset to Launchpad\n")
-
-    max_frames = args.frames if args.video else None
+    print("\n3. Launching MuJoCo 3D Engine...")
     viz = MuJoCoStudioVisualizer(env, policy)
-    viz.run(video_path=args.video, max_frames=max_frames)
+    viz.run(video_path=args.video, max_frames=args.frames)
 
 
 if __name__ == "__main__":
