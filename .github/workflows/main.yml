@@ -1,4 +1,4 @@
-name: 3D PyBullet CyberArena Simulation & Video Export
+name: 3D MuJoCo CyberMarble Simulation & Video Export
 
 on:
   push:
@@ -38,22 +38,22 @@ jobs:
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pybullet raylib mujoco numpy lark "imageio[ffmpeg]"
+          pip install mujoco numpy "imageio[ffmpeg]"
 
-      - name: Run 3D PyBullet Simulation & Render Video
+      - name: Run 3D MuJoCo Simulation & Render Video
         run: |
           GENS="${{ github.event.inputs.generations || '60' }}"
           FRAMES="${{ github.event.inputs.frames || '600' }}"
-          echo "Running 3D PyBullet simulation ($GENS generations, $FRAMES frames)..."
+          echo "Running 3D MuJoCo simulation ($GENS generations, $FRAMES frames)..."
           
-          # xvfb-run provides the virtual OpenGL/GLX display buffer for camera rendering
           xvfb-run -a -s "-screen 0 1920x1080x24" python demo.py \
-            --video cyber_arena_bullet3d.mp4 \
-            --frames "$FRAMES" 
+            --video cyber_marble_3d.mp4 \
+            --frames "$FRAMES" \
+            --generations "$GENS"
 
       - name: Upload 3D Simulation Video
         uses: actions/upload-artifact@v4
         with:
-          name: cyber-arena-3d-video
-          path: cyber_arena_bullet3d.mp4
+          name: cyber-marble-3d-video
+          path: cyber_marble_3d.mp4
           if-no-files-found: error
