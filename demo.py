@@ -32,7 +32,7 @@ MJCF_ARENA = """
     <headlight diffuse="0.85 0.85 0.85" ambient="0.3 0.3 0.4" specular="0.6 0.6 0.6"/>
     <rgba fog="0.05 0.07 0.14 1"/>
     <quality shadowsize="2048"/>
-    <global elevation="-22" azimuth="90"/>
+    <global elevation="-22" azimuth="90" offwidth="1280" offheight="720"/>
   </visual>
 
   <asset>
