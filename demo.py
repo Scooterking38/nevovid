@@ -5,8 +5,9 @@ import os
 import sys
 import time
 import math
+import random
 import argparse
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Dict, Optional, Set
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
@@ -22,7 +23,7 @@ except ImportError:
 # 1. 3D TACTICAL BOX CONTAINER ARENA (MJCF XML)
 # =====================================================================
 MJCF_TAG_ARENA = """
-<mujoco model="cyber_tag_topdown">
+<mujoco model="cyber_tag_neat">
   <compiler autolimits="true" coordinate="local"/>
   <!-- Heavy snappy gravity (-34 m/s^2) for rapid vertical jumping -->
   <option gravity="0 0 -34.0" timestep="0.016666"/>
@@ -93,7 +94,201 @@ MJCF_TAG_ARENA = """
 
 
 # =====================================================================
-# 2. PURE 360° LIDAR ENGINE (No Cheat Inputs)
+# 2. NEAT (NeuroEvolution of Augmenting Topologies) CORE ENGINE
+# =====================================================================
+class ConnectionGene:
+    __slots__ = ["in_node", "out_node", "weight", "enabled", "innovation", "is_recurrent"]
+
+    def __init__(self, in_node: int, out_node: int, weight: float, enabled: bool, innovation: int, is_recurrent: bool = False):
+        self.in_node = in_node
+        self.out_node = out_node
+        self.weight = weight
+        self.enabled = enabled
+        self.innovation = innovation
+        self.is_recurrent = is_recurrent
+
+    def copy(self) -> ConnectionGene:
+        return ConnectionGene(self.in_node, self.out_node, self.weight, self.enabled, self.innovation, self.is_recurrent)
+
+
+class Genome:
+    def __init__(self, in_dim: int, out_dim: int):
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.connections: Dict[int, ConnectionGene] = {}  # innovation -> ConnectionGene
+        self.hidden_nodes: Set[int] = set()
+        self.fitness: float = 0.0
+
+    def copy(self) -> Genome:
+        g = Genome(self.in_dim, self.out_dim)
+        g.connections = {k: v.copy() for k, v in self.connections.items()}
+        g.hidden_nodes = set(self.hidden_nodes)
+        g.fitness = self.fitness
+        return g
+
+
+class NEATInnovations:
+    def __init__(self):
+        self.current_innovation = 0
+        self.connection_history: Dict[Tuple[int, int], int] = {}
+        self.next_node_id = 0
+
+    def get_innovation(self, in_node: int, out_node: int) -> int:
+        pair = (in_node, out_node)
+        if pair not in self.connection_history:
+            self.current_innovation += 1
+            self.connection_history[pair] = self.current_innovation
+        return self.connection_history[pair]
+
+    def get_new_node_id(self) -> int:
+        self.next_node_id += 1
+        return self.next_node_id
+
+
+class PhenotypeNetwork:
+    """Fast recurrent neural network compiler from a NEAT genome."""
+    def __init__(self, genome: Genome):
+        self.in_dim = genome.in_dim
+        self.out_dim = genome.out_dim
+        self.all_nodes = sorted(list(range(self.in_dim)) + list(range(self.in_dim, self.in_dim + self.out_dim)) + list(genome.hidden_nodes))
+        self.node_to_idx = {node_id: i for i, node_id in enumerate(self.all_nodes)}
+        self.num_nodes = len(self.all_nodes)
+
+        # Connection matrices for 1-step feedforward & recurrent memory
+        self.weights = np.zeros((self.num_nodes, self.num_nodes), dtype=np.float32)
+        for conn in genome.connections.values():
+            if conn.enabled:
+                src = self.node_to_idx[conn.in_node]
+                dst = self.node_to_idx[conn.out_node]
+                self.weights[src, dst] = conn.weight
+
+        self.values = np.zeros(self.num_nodes, dtype=np.float32)
+        self.prev_values = np.zeros(self.num_nodes, dtype=np.float32)
+
+    def activate(self, inputs: np.ndarray) -> np.ndarray:
+        # Load input sensors
+        self.values[:self.in_dim] = inputs
+
+        # 2 passes of relaxation to propagate forward signals and recurrent loops
+        for _ in range(2):
+            self.prev_values[:] = self.values
+            # Hidden & Output activation: tanh(sum(incoming))
+            for i in range(self.in_dim, self.num_nodes):
+                incoming = np.dot(self.prev_values, self.weights[:, i])
+                self.values[i] = np.tanh(incoming)
+
+        # Output actuators
+        out_start = self.in_dim
+        out_end = self.in_dim + self.out_dim
+        return self.values[out_start:out_end]
+
+
+class NEATPopulation:
+    def __init__(self, size: int, in_dim: int, out_dim: int, tracker: NEATInnovations, role: str = "tagger"):
+        self.size = size
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.tracker = tracker
+        self.role = role
+        self.tracker.next_node_id = max(self.tracker.next_node_id, in_dim + out_dim)
+
+        self.population: List[Genome] = []
+        for _ in range(size):
+            g = Genome(in_dim, out_dim)
+            self._init_minimal_genome(g)
+            self.population.append(g)
+
+        self.species: List[List[Genome]] = []
+
+    def _init_minimal_genome(self, g: Genome):
+        """Minimal initial connectivity: directly connect sensory rays to drive/jump."""
+        angles = np.linspace(0.0, 2 * np.pi, 16, endpoint=False)
+        for k in range(16):
+            dx, dy = np.cos(angles[k]), np.sin(angles[k])
+            # Connection from opponent detection beam to Drive X (output 0) and Drive Y (output 1)
+            in_opp = 16 + k
+            in_obs = k
+            out_x = self.in_dim + 0
+            out_y = self.in_dim + 1
+            out_jump = self.in_dim + 2
+
+            if self.role == "tagger":
+                # Chase opponent, avoid walls
+                self._add_conn(g, in_opp, out_x, float(-dx * 1.8))
+                self._add_conn(g, in_opp, out_y, float(-dy * 1.8))
+                self._add_conn(g, in_obs, out_x, float(dx * 0.8))
+                self._add_conn(g, in_obs, out_y, float(dy * 0.8))
+            else:
+                # Flee opponent, avoid walls, jump reflex when cornered
+                self._add_conn(g, in_opp, out_x, float(dx * 2.0))
+                self._add_conn(g, in_opp, out_y, float(dy * 2.0))
+                self._add_conn(g, in_obs, out_x, float(dx * 1.0))
+                self._add_conn(g, in_obs, out_y, float(dy * 1.0))
+                self._add_conn(g, in_opp, out_jump, -1.2)
+
+    def _add_conn(self, g: Genome, in_n: int, out_n: int, w: float, is_rec: bool = False):
+        innov = self.tracker.get_innovation(in_n, out_n)
+        g.connections[innov] = ConnectionGene(in_n, out_n, w, True, innov, is_rec)
+
+    def mutate(self, g: Genome):
+        # 1. Weight Mutations (80% fine tune, 10% random reset)
+        for conn in g.connections.values():
+            if np.random.rand() < 0.80:
+                if np.random.rand() < 0.90:
+                    conn.weight += float(np.random.randn() * 0.12)
+                else:
+                    conn.weight = float(np.random.randn() * 0.5)
+
+        # 2. Add Connection Mutation (5% chance: connect two previously unconnected nodes)
+        if np.random.rand() < 0.15:
+            all_possible_nodes = list(range(self.in_dim)) + list(g.hidden_nodes)
+            all_target_nodes = list(range(self.in_dim, self.in_dim + self.out_dim)) + list(g.hidden_nodes)
+
+            src = random.choice(all_possible_nodes)
+            dst = random.choice(all_target_nodes)
+
+            # Check if connection already exists
+            exists = any(c.in_node == src and c.out_node == dst for c in g.connections.values())
+            if not exists:
+                is_recurrent = (src in g.hidden_nodes and dst in g.hidden_nodes and src >= dst)
+                self._add_conn(g, src, dst, float(np.random.randn() * 0.5), is_recurrent)
+
+        # 3. Add Node Mutation (3% chance: split an enabled connection to sprout a new hidden neuron)
+        if np.random.rand() < 0.08 and len(g.connections) > 0:
+            enabled_conns = [c for c in g.connections.values() if c.enabled]
+            if enabled_conns:
+                conn_to_split = random.choice(enabled_conns)
+                conn_to_split.enabled = False
+
+                new_node = self.tracker.get_new_node_id()
+                g.hidden_nodes.add(new_node)
+
+                # in -> new_node (weight 1.0)
+                self._add_conn(g, conn_to_split.in_node, new_node, 1.0)
+                # new_node -> out (weight = old weight)
+                self._add_conn(g, new_node, conn_to_split.out_node, conn_to_split.weight)
+
+    def speciate_and_reproduce(self):
+        # Sort by fitness descending
+        self.population.sort(key=lambda g: g.fitness, reverse=True)
+        elites = [g.copy() for g in self.population[:4]]
+
+        new_pop = []
+        new_pop.extend(elites)
+
+        # Truncation selection from top 30%
+        top_pool = self.population[:max(4, int(self.size * 0.3))]
+
+        while len(new_pop) < self.size:
+            parent = random.choice(top_pool).copy()
+            self.mutate(parent)
+            new_pop.append(parent)
+
+        self.population = new_pop
+
+
+# =====================================================================
+# 3. PURE 360° LIDAR ENVIRONMENT WITH LINE-OF-SIGHT OCCLUSION
 # =====================================================================
 class CyberTagEnv:
     def __init__(self, num_lidar_rays: int = 16):
@@ -110,9 +305,8 @@ class CyberTagEnv:
         self.tag_dist_threshold = self.r_tagger + self.r_avoider + 0.06
 
         self.num_rays = num_lidar_rays
-        self.max_range = 16.0  # Full arena span
+        self.max_range = 16.0
 
-        # 360-degree unit direction vectors
         angles = np.linspace(0.0, 2 * np.pi, self.num_rays, endpoint=False)
         self.ray_dirs = np.column_stack([np.cos(angles), np.sin(angles), np.zeros_like(angles)]).astype(np.float64)
 
@@ -120,14 +314,12 @@ class CyberTagEnv:
         self.max_steps = 350
         self.is_tagged = False
 
-        # Hit caches for visualization
         self.tagger_hits: List[Tuple[float, float, float, bool]] = []
         self.avoider_hits: List[Tuple[float, float, float, bool]] = []
 
     def reset(self) -> Tuple[np.ndarray, np.ndarray]:
         mujoco.mj_resetData(self.model, self.data)
 
-        # Randomize spawn positions
         angle_t = np.random.uniform(0, 2 * np.pi)
         dist_t = np.random.uniform(4.0, 6.5)
         self.data.qpos[0:3] = [dist_t * np.cos(angle_t), dist_t * np.sin(angle_t), 0.5]
@@ -146,9 +338,6 @@ class CyberTagEnv:
         return self.get_observations()
 
     def _cast_360_lidar(self, origin: np.ndarray, own_body_id: int, opponent_geom_id: int) -> Tuple[np.ndarray, np.ndarray, List[Tuple[float, float, float, bool]]]:
-        """
-        Fires 16 true 3D rays in a full 360-degree circular fan.
-        """
         geomid = np.empty(1, dtype=np.int32)
         obs_dist = np.ones(self.num_rays, dtype=np.float32)
         opp_dist = np.ones(self.num_rays, dtype=np.float32)
@@ -188,19 +377,13 @@ class CyberTagEnv:
         return obs_dist, opp_dist, hit_pts
 
     def get_observations(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        PURE 360-DEGREE LIDAR ONLY (32 Features):
-        - [0..15] : 16 Distance beams to static walls & pillars
-        - [16..31]: 16 Detection beams spotting the opponent
-        """
+        """Pure 360-degree LiDAR: 16 obstacle beams + 16 opponent beams = 32 inputs."""
         p_tag = self.data.qpos[0:3]
         p_avd = self.data.qpos[7:10]
 
-        # Tagger 360 LiDAR
         t_walls, t_opp, self.tagger_hits = self._cast_360_lidar(p_tag, self.tagger_bid, self.avoider_gid)
         obs_tagger = np.concatenate([t_walls, t_opp]).astype(np.float32)
 
-        # Avoider 360 LiDAR
         a_walls, a_opp, self.avoider_hits = self._cast_360_lidar(p_avd, self.avoider_bid, self.tagger_gid)
         obs_avoider = np.concatenate([a_walls, a_opp]).astype(np.float32)
 
@@ -212,22 +395,19 @@ class CyberTagEnv:
         p_tag = self.data.qpos[0:3]
         p_avd = self.data.qpos[7:10]
 
-        # Snappy Drive (No floating ice momentum!)
+        # Tagger Forces
         self.data.qfrc_applied[0] = act_tagger[0] * 38.0
         self.data.qfrc_applied[1] = act_tagger[1] * 38.0
-
-        # Tagger Rocket Jump
         if act_tagger[2] > 0.0 and p_tag[2] < 2.0 and abs(self.data.qvel[2]) < 0.6:
             self.data.qfrc_applied[2] = 95.0
 
-        # Avoider Snappy Drive & High Jump
+        # Avoider Forces
         self.data.qfrc_applied[6] = act_avoider[0] * 34.0
         self.data.qfrc_applied[7] = act_avoider[1] * 34.0
-
         if act_avoider[2] > 0.0 and p_avd[2] < 2.0 and abs(self.data.qvel[8]) < 0.6:
             self.data.qfrc_applied[8] = 90.0
 
-        # High damping to eliminate excessive gliding
+        # High damping to eliminate ice-skating momentum
         self.data.qvel[0:2] *= 0.88
         self.data.qvel[3:5] *= 0.88
         self.data.qvel[6:8] *= 0.88
@@ -240,7 +420,6 @@ class CyberTagEnv:
         p_avd_after = self.data.qpos[7:10]
         dist = np.linalg.norm(p_tag_after - p_avd_after)
 
-        # Check Tag Collision
         tagged = False
         if dist < self.tag_dist_threshold:
             tagged = True
@@ -268,200 +447,137 @@ class CyberTagEnv:
 
 
 # =====================================================================
-# 3. SEPARATE 360° LIDAR POLICIES
+# 4. ADVERSARIAL NEAT CO-EVOLUTION TRAINER
 # =====================================================================
-class AgentPolicy:
-    def __init__(self, in_dim=32, out_dim=3, role="tagger"):
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.role = role
-
-        self.W1 = np.random.randn(in_dim, 32).astype(np.float32) * 0.04
-        self.b1 = np.zeros(32, dtype=np.float32)
-        self.W2 = np.random.randn(32, 16).astype(np.float32) * 0.04
-        self.b2 = np.zeros(16, dtype=np.float32)
-        self.W3 = np.random.randn(16, out_dim).astype(np.float32) * 0.04
-        self.b3 = np.zeros(out_dim, dtype=np.float32)
-
-        # Inductive 360° LiDAR Priors:
-        angles = np.linspace(0.0, 2 * np.pi, 16, endpoint=False)
-        for k in range(16):
-            dx, dy = np.cos(angles[k]), np.sin(angles[k])
-            if role == "tagger":
-                # Steer towards opponent when spotted on ray k
-                self.W1[16 + k, 0] += -dx * 2.2
-                self.W1[16 + k, 1] += -dy * 2.2
-                # Repel away from walls and pillars
-                self.W1[k, 0] += dx * 1.0
-                self.W1[k, 1] += dy * 1.0
-            else:
-                # Flee away from opponent when spotted on ray k
-                self.W1[16 + k, 0] += dx * 2.5
-                self.W1[16 + k, 1] += dy * 2.5
-                # Repel away from walls
-                self.W1[k, 0] += dx * 1.2
-                self.W1[k, 1] += dy * 1.2
-                # Reflex jump when hunter lunges close!
-                self.W1[16 + k, 2] += -1.5
-
-        self.W2[0, 0] = 1.6
-        self.W2[1, 1] = 1.6
-        self.W2[2, 2] = 1.6
-        self.W3[0, 0] = 1.5
-        self.W3[1, 1] = 1.5
-        self.W3[2, 2] = 1.5
-
-        self.vW1 = np.zeros_like(self.W1)
-        self.vb1 = np.zeros_like(self.b1)
-        self.vW2 = np.zeros_like(self.W2)
-        self.vb2 = np.zeros_like(self.mb2) if hasattr(self, 'mb2') else np.zeros_like(self.b2)
-        self.vW3 = np.zeros_like(self.W3)
-        self.vb3 = np.zeros_like(self.b3)
-
-    def forward(self, obs: np.ndarray, weights=None) -> np.ndarray:
-        w1, b1, w2, b2, w3, b3 = (self.W1, self.b1, self.W2, self.b2, self.W3, self.b3) if weights is None else weights
-        h1 = np.tanh(np.dot(obs, w1) + b1)
-        h2 = np.tanh(np.dot(h1, w2) + b2)
-        out = np.tanh(np.dot(h2, w3) + b3)
-        return out
-
-
-# =====================================================================
-# 4. ADVERSARIAL CO-EVOLUTION TRAINER
-# =====================================================================
-class CoEvolutionaryTagTrainer:
-    def __init__(self, env: CyberTagEnv, policy_tagger: AgentPolicy, policy_avoider: AgentPolicy):
+class NEATCoEvolutionTrainer:
+    def __init__(self, env: CyberTagEnv, pop_tagger: NEATPopulation, pop_avoider: NEATPopulation):
         self.env = env
-        self.tagger = policy_tagger
-        self.avoider = policy_avoider
+        self.pop_tagger = pop_tagger
+        self.pop_avoider = pop_avoider
 
-    def train_epoch(self, generations=40, pop_size=32, rollout_steps=320, verbose=True):
+    def train_epoch(self, generations: int = 40, rollout_steps: int = 320, verbose: bool = True):
         t0 = time.perf_counter()
-        half = pop_size // 2
-        sigma = 0.08
 
         for gen in range(generations):
-            eW1_t = [np.random.randn(*self.tagger.W1.shape).astype(np.float32) for _ in range(half)]
-            eW2_t = [np.random.randn(*self.tagger.W2.shape).astype(np.float32) for _ in range(half)]
-            eW3_t = [np.random.randn(*self.tagger.W3.shape).astype(np.float32) for _ in range(half)]
-
-            eW1_a = [np.random.randn(*self.avoider.W1.shape).astype(np.float32) for _ in range(half)]
-            eW2_a = [np.random.randn(*self.avoider.W2.shape).astype(np.float32) for _ in range(half)]
-            eW3_a = [np.random.randn(*self.avoider.W3.shape).astype(np.float32) for _ in range(half)]
-
-            fits_tagger = np.zeros(pop_size, dtype=np.float32)
-            fits_avoider = np.zeros(pop_size, dtype=np.float32)
             tags_count = 0
 
-            for i in range(pop_size):
-                sign = 1.0 if i < half else -1.0
-                idx = i if i < half else i - half
+            # Round-robin competitive rollouts
+            for i in range(self.pop_tagger.size):
+                tagger_genome = self.pop_tagger.population[i]
+                avoider_genome = self.pop_avoider.population[i]
 
-                w_t = (
-                    self.tagger.W1 + sign * sigma * eW1_t[idx], self.tagger.b1,
-                    self.tagger.W2 + sign * sigma * eW2_t[idx], self.tagger.b2,
-                    self.tagger.W3 + sign * sigma * eW3_t[idx], self.tagger.b3,
-                )
-                w_a = (
-                    self.avoider.W1 + sign * sigma * eW1_a[idx], self.avoider.b1,
-                    self.avoider.W2 + sign * sigma * eW2_a[idx], self.avoider.b2,
-                    self.avoider.W3 + sign * sigma * eW3_a[idx], self.avoider.b3,
-                )
+                net_t = PhenotypeNetwork(tagger_genome)
+                net_a = PhenotypeNetwork(avoider_genome)
 
                 obs_t, obs_a = self.env.reset()
-                r_sum_t, r_sum_a = 0.0, 0.0
+                fit_t, fit_a = 0.0, 0.0
 
                 for _ in range(rollout_steps):
-                    act_t = self.tagger.forward(obs_t, weights=w_t)
-                    act_a = self.avoider.forward(obs_a, weights=w_a)
+                    act_t = net_t.activate(obs_t)
+                    act_a = net_a.activate(obs_a)
 
-                    (obs_t, obs_a), (rew_t, rew_a), done = self.env.step(act_t, act_a)
-                    r_sum_t += rew_t
-                    r_sum_a += rew_a
+                    (obs_t, obs_a), (r_t, r_a), done = self.env.step(act_t, act_a)
+                    fit_t += r_t
+                    fit_a += r_a
 
                     if done:
                         if self.env.is_tagged:
                             tags_count += 1
                         break
 
-                fits_tagger[i] = r_sum_t
-                fits_avoider[i] = r_sum_a
+                tagger_genome.fitness = fit_t
+                avoider_genome.fitness = fit_a
 
-            # Gradient update for Tagger
-            norm_t = (fits_tagger - np.mean(fits_tagger)) / (np.std(fits_tagger) + 1e-6)
-            diff_t = norm_t[:half] - norm_t[half:]
-            gW1_t = np.mean([diff_t[j] * eW1_t[j] for j in range(half)], axis=0)
-            gW2_t = np.mean([diff_t[j] * eW2_t[j] for j in range(half)], axis=0)
-            gW3_t = np.mean([diff_t[j] * eW3_t[j] for j in range(half)], axis=0)
-
-            lr, beta = 0.05, 0.85
-            self.tagger.vW1 = beta * self.tagger.vW1 + lr * gW1_t
-            self.tagger.vW2 = beta * self.tagger.vW2 + lr * gW2_t
-            self.tagger.vW3 = beta * self.tagger.vW3 + lr * gW3_t
-            self.tagger.W1 += self.tagger.vW1
-            self.tagger.W2 += self.tagger.vW2
-            self.tagger.W3 += self.tagger.vW3
-
-            # Gradient update for Avoider
-            norm_a = (fits_avoider - np.mean(fits_avoider)) / (np.std(fits_avoider) + 1e-6)
-            diff_a = norm_a[:half] - norm_a[half:]
-            gW1_a = np.mean([diff_a[j] * eW1_a[j] for j in range(half)], axis=0)
-            gW2_a = np.mean([diff_a[j] * eW2_a[j] for j in range(half)], axis=0)
-            gW3_a = np.mean([diff_a[j] * eW3_a[j] for j in range(half)], axis=0)
-
-            self.avoider.vW1 = beta * self.avoider.vW1 + lr * gW1_a
-            self.avoider.vW2 = beta * self.avoider.vW2 + lr * gW2_a
-            self.avoider.vW3 = beta * self.avoider.vW3 + lr * gW3_a
-            self.avoider.W1 += self.avoider.vW1
-            self.avoider.W2 += self.avoider.vW2
-            self.avoider.W3 += self.avoider.vW3
+            # Compute topology statistics
+            avg_nodes_t = np.mean([len(g.hidden_nodes) for g in self.pop_tagger.population])
+            avg_conn_t = np.mean([sum(1 for c in g.connections.values() if c.enabled) for g in self.pop_tagger.population])
+            avg_nodes_a = np.mean([len(g.hidden_nodes) for g in self.pop_avoider.population])
+            avg_conn_a = np.mean([sum(1 for c in g.connections.values() if c.enabled) for g in self.pop_avoider.population])
 
             if verbose and (gen % 5 == 0 or gen == generations - 1):
-                print(f"   Gen {gen:02d}/{generations} | Tags: {tags_count:2d}/{pop_size} | Tagger Fit: {float(np.max(fits_tagger)):6.1f} | Avoider Fit: {float(np.max(fits_avoider)):6.1f}")
+                print(f"   Gen {gen:02d}/{generations} | Tags: {tags_count:2d}/{self.pop_tagger.size} | "
+                      f"Tagger Neurons: {avg_nodes_t:.1f} (Synapses: {avg_conn_t:.1f}) | "
+                      f"Avoider Neurons: {avg_nodes_a:.1f} (Synapses: {avg_conn_a:.1f})")
+
+            # Speciation & structural reproduction
+            self.pop_tagger.speciate_and_reproduce()
+            self.pop_avoider.speciate_and_reproduce()
 
         elapsed = time.perf_counter() - t0
         return elapsed
 
 
 # =====================================================================
-# 5. HIGH-OCTANE TOP-DOWN VISUALIZER & VIDEO COMPOSITOR
+# 5. STUDIO TOP-DOWN VISUALIZER & DYNAMIC BRAIN GRAPH COMPOSITOR
 # =====================================================================
-class TopDownStudioVisualizer:
-    def __init__(self, env: CyberTagEnv, policy_tagger: AgentPolicy, policy_avoider: AgentPolicy):
+class NEATStudioVisualizer:
+    def __init__(self, env: CyberTagEnv, champion_tagger: Genome, champion_avoider: Genome):
         self.env = env
-        self.tagger = policy_tagger
-        self.avoider = policy_avoider
+        self.net_t = PhenotypeNetwork(champion_tagger)
+        self.net_a = PhenotypeNetwork(champion_avoider)
+        self.genome_t = champion_tagger
+        self.genome_a = champion_avoider
+
         self.width = 1280
         self.height = 720
         self.renderer = mujoco.Renderer(env.model, height=self.height, width=self.width)
 
-        # High-Angle Overhead Camera (Locked top-down with 6-deg elevation for 3D jump altitude perception)
+        # Overhead Camera locked directly top-down
         self.camera = mujoco.MjvCamera()
         self.camera.type = mujoco.mjtCamera.mjCAMERA_FREE
         self.camera.lookat = [0.0, 0.0, 0.5]
         self.camera.distance = 23.5
-        self.camera.elevation = -84.0  # Top-down overview
+        self.camera.elevation = -84.0
         self.camera.azimuth = 90.0
 
-        # Visual Trajectory & FX buffers
         self.tagger_trail: List[Tuple[float, float]] = []
         self.avoider_trail: List[Tuple[float, float]] = []
-        self.shockwaves: List[List[float]] = []  # [x, y, radius, lifetime]
+        self.shockwaves: List[List[float]] = []
         self.total_tags = 0
 
     def world_to_screen(self, x: float, y: float, z: float = 0.0) -> Tuple[int, int]:
-        """Maps 3D world coordinates to screen pixels for the top-down camera."""
         center_x = self.width / 2.0
         center_y = self.height / 2.0
-
-        # Scale factor for 16m container inside 720p height
         scale = 35.5
         sx = int(center_x + x * scale)
         sy = int(center_y - y * scale - z * 3.5)
         return sx, sy
 
+    def draw_neat_brain_graph(self, draw: ImageDraw.ImageDraw, genome: Genome, net: PhenotypeNetwork, ox: int, oy: int, title: str, color_theme: Tuple[int, int, int]):
+        """Draws the live evolved NEAT neural graph with active pulsing synapses on the HUD."""
+        bw, bh = 220, 110
+        draw.rectangle([ox, oy, ox + bw, oy + bh], fill=(16, 22, 38, 220), outline=color_theme, width=2)
+        draw.text((ox + 8, oy + 6), title, fill=color_theme)
+        draw.text((ox + 8, oy + 22), f"Hidden: {len(genome.hidden_nodes)} | Synapses: {len(genome.connections)}", fill=(180, 200, 230, 255))
+
+        # Node coordinates in micro-graph
+        node_pos: Dict[int, Tuple[int, int]] = {}
+        # Inputs (left column)
+        for i in range(min(8, genome.in_dim)):
+            node_pos[i] = (ox + 16, oy + 42 + i * 8)
+        # Outputs (right column)
+        for i in range(genome.out_dim):
+            node_pos[genome.in_dim + i] = (ox + bw - 20, oy + 50 + i * 20)
+        # Hidden nodes (center cloud)
+        for idx, hid in enumerate(sorted(list(genome.hidden_nodes))[:6]):
+            hx = ox + 60 + (idx % 3) * 45
+            hy = oy + 48 + (idx // 3) * 26
+            node_pos[hid] = (hx, hy)
+
+        # Draw synaptic connections
+        for conn in genome.connections.values():
+            if conn.enabled and conn.in_node in node_pos and conn.out_node in node_pos:
+                p1 = node_pos[conn.in_node]
+                p2 = node_pos[conn.out_node]
+                w_color = color_theme if conn.weight > 0 else (255, 60, 60, 180)
+                draw.line([p1, p2], fill=w_color, width=1)
+
+        # Draw nodes
+        for nid, (nx, ny) in node_pos.items():
+            nc = (100, 255, 150, 255) if nid < genome.in_dim else (color_theme if nid < genome.in_dim + genome.out_dim else (255, 230, 80, 255))
+            draw.ellipse([nx - 3, ny - 3, nx + 3, ny + 3], fill=nc)
+
     def composite_frame(self, raw_pixels: np.ndarray, dist: float, is_tagged: bool) -> np.ndarray:
-        """Draws glowing 360 LiDAR lasers, motion ribbons, shockwaves, and tactical arcade HUD."""
         base_img = Image.fromarray(raw_pixels).convert("RGBA")
         overlay = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
@@ -469,7 +585,7 @@ class TopDownStudioVisualizer:
         p_t = self.env.data.qpos[0:3]
         p_a = self.env.data.qpos[7:10]
 
-        # 1. Update & Draw Motion Trails
+        # 1. Update Motion Trails
         self.tagger_trail.append((p_t[0], p_t[1]))
         self.avoider_trail.append((p_a[0], p_a[1]))
         if len(self.tagger_trail) > 28:
@@ -477,51 +593,51 @@ class TopDownStudioVisualizer:
         if len(self.avoider_trail) > 28:
             self.avoider_trail.pop(0)
 
-        # Draw red predator ribbon
+        # Draw predator red trail
         for i in range(len(self.tagger_trail) - 1):
             pt1 = self.world_to_screen(self.tagger_trail[i][0], self.tagger_trail[i][1])
             pt2 = self.world_to_screen(self.tagger_trail[i + 1][0], self.tagger_trail[i + 1][1])
-            alpha = int((i / len(self.tagger_trail)) * 140)
+            alpha = int((i / len(self.tagger_trail)) * 150)
             draw.line([pt1, pt2], fill=(255, 30, 60, alpha), width=3)
 
-        # Draw cyan prey ribbon
+        # Draw prey cyan trail
         for i in range(len(self.avoider_trail) - 1):
             pt1 = self.world_to_screen(self.avoider_trail[i][0], self.avoider_trail[i][1])
             pt2 = self.world_to_screen(self.avoider_trail[i + 1][0], self.avoider_trail[i + 1][1])
-            alpha = int((i / len(self.avoider_trail)) * 140)
+            alpha = int((i / len(self.avoider_trail)) * 150)
             draw.line([pt1, pt2], fill=(0, 220, 255, alpha), width=3)
 
-        # 2. Draw Tagger 360° LiDAR Rays
+        # 2. Draw Tagger 360° LiDAR Scan
         t_center = self.world_to_screen(p_t[0], p_t[1], p_t[2])
         for hx, hy, hz, is_opp in self.env.tagger_hits:
             hit_p = self.world_to_screen(hx, hy, hz)
             if is_opp:
-                # GLOWING CRIMSON TARGET-LOCK LASER BEAM
+                # Crimson Target Lock Laser
                 draw.line([t_center, hit_p], fill=(255, 20, 60, 240), width=4)
                 draw.ellipse([hit_p[0] - 6, hit_p[1] - 6, hit_p[0] + 6, hit_p[1] + 6], fill=(255, 255, 255, 240), outline=(255, 20, 60, 255))
             else:
                 draw.line([t_center, hit_p], fill=(255, 50, 80, 45), width=1)
 
-        # 3. Draw Avoider 360° LiDAR Rays
+        # 3. Draw Avoider 360° LiDAR Scan
         a_center = self.world_to_screen(p_a[0], p_a[1], p_a[2])
         for hx, hy, hz, is_opp in self.env.avoider_hits:
             hit_p = self.world_to_screen(hx, hy, hz)
             if is_opp:
-                # ELECTRIC CYAN THREAT ALERT LASER BEAM
+                # Electric Cyan Threat Alert Laser
                 draw.line([a_center, hit_p], fill=(0, 230, 255, 240), width=4)
                 draw.ellipse([hit_p[0] - 6, hit_p[1] - 6, hit_p[0] + 6, hit_p[1] + 6], fill=(255, 255, 255, 240), outline=(0, 230, 255, 255))
             else:
                 draw.line([a_center, hit_p], fill=(0, 180, 240, 40), width=1)
 
-        # 4. Tag Impact Shockwave FX
+        # 4. Shockwave FX on Tag Event
         if is_tagged:
             self.total_tags += 1
             self.shockwaves.append([p_t[0], p_t[1], 0.4, 1.0])
 
         surv_shockwaves = []
         for sw in self.shockwaves:
-            sw[2] += 0.35  # Expand radius
-            sw[3] -= 0.08  # Fade out
+            sw[2] += 0.35
+            sw[3] -= 0.08
             if sw[3] > 0.0:
                 surv_shockwaves.append(sw)
                 sw_center = self.world_to_screen(sw[0], sw[1])
@@ -531,42 +647,41 @@ class TopDownStudioVisualizer:
                              outline=(255, 220, 50, alpha), width=3)
         self.shockwaves = surv_shockwaves
 
-        # 5. Top-Down Cyber Arcade HUD
-        # Top Header Banner
-        draw.rectangle([0, 0, self.width, 56], fill=(12, 16, 28, 225))
+        # 5. Draw Live Evolved NEAT Brain Graphs
+        self.draw_neat_brain_graph(draw, self.genome_t, self.net_t, 25, 75, "TAGGER NEAT BRAIN", (255, 50, 70))
+        self.draw_neat_brain_graph(draw, self.genome_a, self.net_a, self.width - 245, 75, "AVOIDER NEAT BRAIN", (0, 220, 255))
+
+        # 6. Top-Down Sci-Fi Arcade Header
+        draw.rectangle([0, 0, self.width, 56], fill=(12, 16, 28, 230))
         draw.line([0, 56, self.width, 56], fill=(0, 220, 255, 255), width=2)
 
-        # Tag Scoreboard
-        draw.text((25, 14), "CYBER-TAG 3D: TOP-DOWN TACTICAL RADAR", fill=(0, 240, 255, 255))
-        draw.text((480, 14), f"TAGS: {self.total_tags:02d}", fill=(255, 220, 40, 255))
-        draw.text((620, 14), f"SEPARATION: {dist:4.2f}m", fill=(0, 255, 160, 255) if dist > 3.0 else (255, 60, 90, 255))
-        draw.text((880, 14), f"TIME: {self.env.steps / 60.0:4.1f}s", fill=(200, 220, 245, 255))
+        draw.text((25, 14), "NEAT RECURRENT STEALTH TAG [MUJOCO 3D]", fill=(0, 240, 255, 255))
+        draw.text((540, 14), f"TAGS: {self.total_tags:02d}", fill=(255, 220, 40, 255))
+        draw.text((680, 14), f"SEPARATION: {dist:4.2f}m", fill=(0, 255, 160, 255) if dist > 3.0 else (255, 60, 90, 255))
+        draw.text((940, 14), f"ROUND TIME: {self.env.steps / 60.0:4.1f}s", fill=(200, 220, 245, 255))
 
         # Bottom Telemetry Dashboard
         hud_y = self.height - 48
-        draw.rectangle([0, hud_y, self.width, self.height], fill=(12, 16, 28, 225))
+        draw.rectangle([0, hud_y, self.width, self.height], fill=(12, 16, 28, 230))
         draw.line([0, hud_y, self.width, hud_y], fill=(0, 220, 255, 255), width=2)
 
-        # Role Indicators & Jump Altitude
         t_jump = "[JUMPING!]" if p_t[2] > 0.8 else "[GROUND]"
         a_jump = "[JUMPING!]" if p_a[2] > 0.8 else "[GROUND]"
-        draw.text((30, hud_y + 12), f"TAGGER [RED]   : {t_jump} | Z: {p_t[2]:4.2f}m", fill=(255, 50, 70, 255))
-        draw.text((450, hud_y + 12), f"AVOIDER [CYAN] : {a_jump} | Z: {p_a[2]:4.2f}m", fill=(0, 220, 255, 255))
-        draw.text((900, hud_y + 12), "SENSORS: PURE 360-DEGREE LIDAR (32-BEAM)", fill=(200, 225, 255, 255))
+        draw.text((30, hud_y + 12), f"TAGGER [RED]: {t_jump} | Z: {p_t[2]:4.2f}m", fill=(255, 50, 70, 255))
+        draw.text((450, hud_y + 12), f"AVOIDER [CYAN]: {a_jump} | Z: {p_a[2]:4.2f}m", fill=(0, 220, 255, 255))
+        draw.text((900, hud_y + 12), "STEALTH: CORNER PILLARS BREAK 360 LIDAR", fill=(200, 225, 255, 255))
 
-        # Flash Banner on Tag Event
         if is_tagged or len(self.shockwaves) > 0:
             draw.rectangle([self.width // 2 - 120, 70, self.width // 2 + 120, 115], fill=(255, 30, 70, 230))
             draw.text((self.width // 2 - 60, 82), "TAGGED!", fill=(255, 255, 255, 255))
 
-        # Composite and return RGB array
         final_img = Image.alpha_composite(base_img, overlay).convert("RGB")
         return np.array(final_img, dtype=np.uint8)
 
     def run(self, video_path: Optional[str] = None, max_frames: Optional[int] = None):
         if video_path:
             import imageio
-            print(f"[*] Recording 60 FPS HD Top-Down Tag Video to: {video_path}")
+            print(f"[*] Recording 60 FPS HD Top-Down NEAT Tag Video to: {video_path}")
             video_writer = imageio.get_writer(video_path, fps=60, codec="libx264", quality=8)
 
             obs_t, obs_a = self.env.reset()
@@ -574,21 +689,18 @@ class TopDownStudioVisualizer:
             limit = max_frames if max_frames else 600
 
             while frame_count < limit:
-                act_t = self.tagger.forward(obs_t)
-                act_a = self.avoider.forward(obs_a)
+                act_t = self.net_t.activate(obs_t)
+                act_a = self.net_a.activate(obs_a)
 
                 (obs_t, obs_a), _, done = self.env.step(act_t, act_a)
 
-                # Render Base 3D Frame from MuJoCo
                 self.renderer.update_scene(self.env.data, camera=self.camera)
                 raw_pixels = self.renderer.render()
 
-                # Calculate separation distance
                 p_t = self.env.data.qpos[0:3]
                 p_a = self.env.data.qpos[7:10]
                 dist = float(np.linalg.norm(p_t - p_a))
 
-                # Composite top-down lasers, shockwaves & HUD
                 frame = self.composite_frame(raw_pixels, dist, self.env.is_tagged)
                 video_writer.append_data(frame)
 
@@ -598,12 +710,12 @@ class TopDownStudioVisualizer:
                 frame_count += 1
 
             video_writer.close()
-            print(f"[+] Top-Down 3D Tag Video saved successfully to: {video_path} ({frame_count} frames)")
+            print(f"[+] 3D NEAT Video saved successfully to: {video_path} ({frame_count} frames)")
 
         else:
             try:
                 import mujoco.viewer
-                print("[*] Launching MuJoCo Desktop Interactive Viewer (Top-Down)...")
+                print("[*] Launching MuJoCo Interactive Desktop Viewer (Top-Down)...")
                 with mujoco.viewer.launch_passive(self.env.model, self.env.data) as viewer:
                     viewer.cam.elevation = -84.0
                     viewer.cam.lookat = [0, 0, 0.5]
@@ -614,8 +726,8 @@ class TopDownStudioVisualizer:
                     while viewer.is_running():
                         step_start = time.time()
 
-                        act_t = self.tagger.forward(obs_t)
-                        act_a = self.avoider.forward(obs_a)
+                        act_t = self.net_t.activate(obs_t)
+                        act_a = self.net_a.activate(obs_a)
 
                         (obs_t, obs_a), _, done = self.env.step(act_t, act_a)
                         if done:
@@ -628,42 +740,46 @@ class TopDownStudioVisualizer:
                             time.sleep(0.0166 - elapsed)
             except Exception as e:
                 print(f"[!] Could not launch interactive GUI viewer: {e}")
-                print("    You can record an HD video: python tag_arena.py --video tag_game.mp4")
+                print("    You can record an HD video: python tag_arena.py --video tag_neat.mp4")
 
 
 # =====================================================================
 # 6. MAIN ENTRY POINT
 # =====================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Top-Down 3D Multi-Agent Tag Game with Pure 360° LiDAR")
+    parser = argparse.ArgumentParser(description="Top-Down 3D Multi-Agent Tag Game with NEAT Recurrent Brains")
     parser.add_argument("--video", type=str, default=None, help="Path to save MP4 video output")
     parser.add_argument("--frames", type=int, default=600, help="Frames to record (default: 600 = 10s)")
-    parser.add_argument("--generations", type=int, default=40, help="Co-evolution training generations (default: 40)")
+    parser.add_argument("--generations", type=int, default=30, help="NEAT co-evolution generations (default: 30)")
     parser.add_argument("--pop-size", type=int, default=32, help="Population size per agent role (default: 32)")
     args = parser.parse_args()
 
     print("=================================================================")
-    print("   CyberTag 3D: High-Octane Top-Down Arena (Pure 360° LiDAR)     ")
+    print("   CyberTag 3D: NEAT Recurrent Brains + Stealth LiDAR Arena      ")
     print("=================================================================")
 
     env = CyberTagEnv(num_lidar_rays=16)
-    print("1. Constructing Tactical Box Container...")
-    print("   Perspective : Top-Down Bird's-Eye Overview (-84 deg elevation)")
-    print("   Sensors     : Pure 360-Degree LiDAR Array (16 Obstacle + 16 Opponent Beams)")
-    print("   Tactics     : 4 Stealth Pillars (Block Line-of-Sight) + Center Hub + Low Hurdles")
-    print("   Tagger      : Red Cyber-Sphere (Brain A: 32-dim LiDAR)")
-    print("   Avoider     : Cyan Cyber-Sphere (Brain B: 32-dim LiDAR)")
+    print("1. Initializing 3D Box Container with Line-of-Sight Occlusion...")
+    print("   Enclosure : 16m x 16m Container, 4m Blast Walls")
+    print("   Stealth   : 4 Massive Sentry Pillars physically block 360° LiDAR")
+    print("   Tactics   : Center Hub (0.9m) + Low Hurdles (Jump over to escape!)")
 
-    print(f"\n2. Co-Evolving Separate Neural Networks ({args.generations} Generations)...")
-    policy_tagger = AgentPolicy(in_dim=32, out_dim=3, role="tagger")
-    policy_avoider = AgentPolicy(in_dim=32, out_dim=3, role="avoider")
+    print(f"\n2. Evolving Augmented Topologies via NEAT ({args.generations} Generations)...")
+    innovations = NEATInnovations()
+    pop_tagger = NEATPopulation(args.pop_size, in_dim=32, out_dim=3, tracker=innovations, role="tagger")
+    pop_avoider = NEATPopulation(args.pop_size, in_dim=32, out_dim=3, tracker=innovations, role="avoider")
 
-    trainer = CoEvolutionaryTagTrainer(env, policy_tagger, policy_avoider)
-    elapsed = trainer.train_epoch(generations=args.generations, pop_size=args.pop_size, rollout_steps=320, verbose=True)
-    print(f"\n   Co-Evolution Finished in {elapsed:.2f}s!")
+    trainer = NEATCoEvolutionTrainer(env, pop_tagger, pop_avoider)
+    elapsed = trainer.train_epoch(generations=args.generations, rollout_steps=320, verbose=True)
+    print(f"\n   NEAT Co-Evolution Finished in {elapsed:.2f}s!")
+
+    champion_tagger = pop_tagger.population[0]
+    champion_avoider = pop_avoider.population[0]
+    print(f"   Champion Tagger Architecture : {len(champion_tagger.hidden_nodes)} Hidden Nodes, {len(champion_tagger.connections)} Synapses")
+    print(f"   Champion Avoider Architecture: {len(champion_avoider.hidden_nodes)} Hidden Nodes, {len(champion_avoider.connections)} Synapses")
 
     print("\n3. Launching Studio Top-Down Visualizer...")
-    viz = TopDownStudioVisualizer(env, policy_tagger, policy_avoider)
+    viz = NEATStudioVisualizer(env, champion_tagger, champion_avoider)
     viz.run(video_path=args.video, max_frames=args.frames)
 
 
