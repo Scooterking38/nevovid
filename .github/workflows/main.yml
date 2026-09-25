@@ -1,4 +1,4 @@
-name: NevoRL CyberArena Simulation & Video Export
+name: 3D PyBullet CyberArena Simulation & Video Export
 
 on:
   push:
@@ -33,26 +33,29 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb ffmpeg libsdl2-dev
+          sudo apt-get install -y xvfb ffmpeg libgl1-mesa-glx libgl1-mesa-dri libglu1-mesa
 
       - name: Install Python Dependencies
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install pybullet numpy lark "imageio[ffmpeg]"
 
-      - name: Run Simulation and Record Video
+      - name: Run 3D PyBullet Simulation & Render Video
         run: |
           GENS="${{ github.event.inputs.generations || '60' }}"
           FRAMES="${{ github.event.inputs.frames || '600' }}"
-          echo "Training with $GENS generations and recording $FRAMES frames..."
-          xvfb-run -a -s "-screen 0 1280x1024x24" python demo.py \
-            --video cyber_arena.mp4 \
+          echo "Running 3D PyBullet simulation ($GENS generations, $FRAMES frames)..."
+          
+          # xvfb-run provides the virtual OpenGL/GLX display buffer for camera rendering
+          xvfb-run -a -s "-screen 0 1920x1080x24" python demo.py \
+            --headless \
+            --video cyber_arena_bullet3d.mp4 \
             --frames "$FRAMES" \
             --generations "$GENS"
 
-      - name: Upload Video Artifact
+      - name: Upload 3D Simulation Video
         uses: actions/upload-artifact@v4
         with:
-          name: cyber-arena-simulation-video
-          path: cyber_arena.mp4
+          name: cyber-arena-3d-video
+          path: cyber_arena_bullet3d.mp4
           if-no-files-found: error
