@@ -33,7 +33,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb ffmpeg libgl1-mesa-glx libgl1-mesa-dri libglu1-mesa
+          sudo apt-get install -y xvfb ffmpeg libgl1 libglx-mesa0 libgl1-mesa-dri libglu1-mesa
 
       - name: Install Python Dependencies
         run: |
