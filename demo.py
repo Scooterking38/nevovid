@@ -23,28 +23,28 @@ from nevorl import NevoRLCompiler
 # =====================================================================
 ASCII_CIRCUIT = """
 ##############################
-#SXXXXXXXX#XXXXXXXXXXXXXXXXXX#
-#XXXXXXXXX#XXXXXXXXXXXXXXXXXX#
-#XXXXXXXXX#XXXX##########XXXX#
-#XXXX#####XXXXX#XXXXXXXX#XXXX#
-#XXXX#XXXXXXXXX#XXXXXXXX#XXXX#
-#XXXX#XXXXXXXXX#XXX##XXX#XXXX#
-#XXXX#XXXX######XXX##XXX#XXXX#
-#XXXX#XXXX#XXXXXXXX##XXXXXXXX#
-#XXXX#XXXX#XXXXXXXXXXXXXXXXXX#
-#XXXXXXXXX#XXXX##########XXXX#
-#XXXXXXXXX#XXXX#XXXXXXXX#XXXX#
-######XXXX######XXXXXXXX######
-#XXXXXXXXXXXXXX#XXXX#####XXXX#
-#XXXXXXXXXXXXXX#XXXX#####X##X#
-#XXXX##########XXXXX#####X#XX#
-#XXXX#XX#################X#X##
-#XXXX#XX####XXXXXXXX#####X#XX#
-#XXXX#XX#####XXXXXXXX###XX##X#
-#XXXX#XX###############XXX#XX#
-#XXXX#XX#XXXXXXX#######XXX#XX#
-#XXXXXXX###XXXXX#######X####X#
-#XXXXXXXXXXXXXXXXXXXXXXX#XXXG#
+#XXXXXXXX#XXXXXXXXXXXXXXXXXX##
+#X############################
+#X##########################X#
+#XXXX#######################X#
+#XXXX#######################X#
+#XXXX#########################
+#XXXX#######################X#
+#XXXX#######################X#
+#XXXX#########################
+#XXXX#######################X#
+#XXXX#######################X#
+##############################
+##############################
+#X############################
+#X############################
+#X############################
+#X##########################X#
+#X##########################X#
+#X##########################X#
+#X##########################X#
+#X##########################X#
+#S##########################G#
 ##############################
 """
 
@@ -114,7 +114,7 @@ def generate_procedural_maze(width: int = 30, height: int = 24, seed: Optional[i
 
 
 # =====================================================================
-# 2. NEVORL ENVIRONMENT (Bird's-Eye View Only - No BFS / Path Cheating)
+# 2. NEVORL ENVIRONMENT (Exploration & Safe-Flight Physics)
 # =====================================================================
 def build_environment_source(start_pt: Tuple[float, float], goal_pt: Tuple[float, float]) -> str:
     return f"""
@@ -136,7 +136,7 @@ env CyberArena {{
     observation {{
         let rays = raycast_fan(state.pos, state.heading, 2.094, 5, 6.5);
 
-        // Pure Bird's-Eye View: Euclidean vector to Goal Beacon
+        // Pure Bird's-Eye View: Euclidean vector to Goal Beacon (no maze graph / BFS)
         let to_target = state.target - state.pos;
         let target_dist = length(to_target);
         let target_dir = to_target / (target_dist + 0.0001);
@@ -145,7 +145,7 @@ env CyberArena {{
         let ego_vel = rotate(state.vel, -state.heading);
 
         let speed = length(state.vel);
-        let can_jump = where((state.z <= 0.02) and (speed > 0.15), 1.0, 0.0);
+        let can_jump = where((state.z <= 0.02) and (speed > 0.18), 1.0, 0.0);
 
         // Dim = 15:
         // [0..4]: rays, [5]: heading, [6]: target_dist, [7..8]: target_dir, [9]: z
@@ -169,10 +169,10 @@ env CyberArena {{
         let wants_jump = act[2] > 0.0;
         let on_ground = state.z <= 0.02;
         let speed = length(state.vel);
-        let high_speed = speed > 0.15;
+        let high_speed = speed > 0.18;
         let do_jump = on_ground and wants_jump and high_speed;
 
-        // Launch kinematics: vz=0.40, gravity=-0.028 (28-step arc, flies 10.6 grid units)
+        // Launch kinematics: vz=0.40, gravity=-0.028
         state.vz = where(do_jump, 0.40, state.vz - 0.028);
         state.z = clamp(state.z + state.vz, 0.0, 3.5);
         state.vz = where(state.z <= 0.0, 0.0, state.vz);
@@ -191,25 +191,22 @@ env CyberArena {{
         let target_dist = length(to_target);
         let target_dir = to_target / (target_dist + 0.0001);
         let speed = length(state.vel);
-        let airborne = state.z > 0.08;
 
-        // Velocity directed toward the Goal Beacon in Bird's-Eye space
+        // Continuous progress incentives: forward velocity toward beacon
         let beacon_vel = state.vel.x * target_dir.x + state.vel.y * target_dir.y;
-        let fwd_x = cos(state.heading);
-        let fwd_y = sin(state.heading);
-        let alignment = fwd_x * target_dir.x + fwd_y * target_dir.y;
+        let progress_reward = beacon_vel * 14.0;
+        let speed_bonus = speed * 8.0;
 
-        let progress_reward = beacon_vel * 18.0;
-        let speed_bonus = speed * 10.0;
-
-        // Massive airtime reward for launching over walls toward the goal beacon!
-        let air_bonus = where(airborne, 8.0 + speed * 16.0 + alignment * 6.0, 0.0);
+        // Alive reward for clean ground driving
+        let alive_bonus = where(state.crashed < 0.5, 0.8, 0.0);
 
         let reached_goal = (target_dist < 1.8) and (state.z <= 0.08);
         let goal_bonus = where(reached_goal, 10000.0, 0.0);
-        let crash_tax = where(state.crashed > 0.5, 60.0, 0.0);
 
-        return progress_reward + speed_bonus + air_bonus + goal_bonus - crash_tax;
+        // Strict penalty for wall collisions and bad landings (no free airtime points!)
+        let crash_tax = where(state.crashed > 0.5, 260.0, 0.0);
+
+        return progress_reward + speed_bonus + alive_bonus + goal_bonus - crash_tax;
     }}
 
     terminal {{
@@ -221,7 +218,7 @@ env CyberArena {{
 """
 
 # =====================================================================
-# 3. ANTITHETIC EVOLUTION STRATEGY (With Wall-Launch NumPy Prior)
+# 3. ANTITHETIC EVOLUTION STRATEGY (Exploration & Safe Jumps)
 # =====================================================================
 class FastNeuroEvolution:
     def __init__(self, pop_size=1024, in_dim=16, out_dim=3):
@@ -231,7 +228,7 @@ class FastNeuroEvolution:
         self.out_dim = out_dim
         self.generation = 0
 
-        # Master Policy Weights (16 inputs including jump shortcut computed in Python)
+        # Master Policy Weights
         self.mW1 = np.random.randn(in_dim, 32).astype(np.float32) * 0.02
         self.mb1 = np.zeros(32, dtype=np.float32)
         self.mW2 = np.random.randn(32, 16).astype(np.float32) * 0.02
@@ -246,29 +243,31 @@ class FastNeuroEvolution:
         self.vW3 = np.zeros_like(self.mW3)
         self.vb3 = np.zeros_like(self.mb3)
 
-        # 1. Steering: Seek Bird's-Eye Goal Beacon + Avoid Local Walls
-        self.mW1[11, 0] = 2.4     # ego_target.y -> steer
-        self.mW1[0, 0] = -0.4     # left ray repulsion
-        self.mW1[1, 0] = -0.8
-        self.mW1[3, 0] = 0.8      # right ray repulsion
-        self.mW1[4, 0] = 0.4
+        # 1. Steering Prior: Strong wall avoidance + beacon seeking
+        self.mW1[11, 0] = 2.0     # ego_target.y -> steer towards beacon
+        self.mW1[0, 0] = -2.2     # Strong left outer ray repulsion
+        self.mW1[1, 0] = -3.4     # Strong left inner ray repulsion
+        self.mW1[3, 0] = 3.4      # Strong right inner ray repulsion
+        self.mW1[4, 0] = 2.2      # Strong right outer ray repulsion
         self.mW2[0, 0] = 1.8
-        self.mW3[0, 0] = 1.5
+        self.mW3[0, 0] = 1.6
 
-        # 2. Racing Throttle (Forward drive toward beacon)
-        self.mW1[10, 1] = 1.4     # ego_target.x
-        self.mW1[2, 1] = 1.2      # center clearance
-        self.mW2[1, 1] = 1.5
-        self.mW3[1, 1] = 1.2
-        self.mb3[1] = 1.0         # Full throttle forward bias
+        # 2. Racing Throttle: High drive when forward path is clear
+        self.mW1[2, 1] = 2.4      # center clearance boosts throttle
+        self.mW1[10, 1] = 1.2     # forward target component
+        self.mW2[1, 1] = 1.6
+        self.mW3[1, 1] = 1.4
+        self.mb3[1] = 0.95        # baseline forward throttle
 
-        # 3. Wall Jump Shortcut Connection
-        self.mW1[15, 2] = 2.6     # jump_opportunity -> h1[2]
-        self.mW1[14, 2] = 1.2     # can_jump
-        self.mb1[2] = 0.3
-        self.mW2[2, 2] = 2.0      # h1[2] -> h2[2]
-        self.mW3[2, 2] = 1.8      # h2[2] -> jump (act[2])
-        self.mb3[2] = 0.2         # Active launch bias
+        # 3. Controlled Wall Launch Shortcut:
+        # Require forward momentum and clear launch opportunity, suppress point-blank crashes
+        self.mW1[15, 2] = 2.4     # safe jump opportunity signal
+        self.mW1[14, 2] = 1.6     # can_jump
+        self.mW1[2, 2] = -1.8     # Suppress jump if center wall is <0.20 (avoids point-blank suicides)
+        self.mb1[2] = -0.2
+        self.mW2[2, 2] = 1.8
+        self.mW3[2, 2] = 1.6
+        self.mb3[2] = -0.65       # Negative baseline bias: jumps must be calculated, not spam
 
         self.W1 = np.zeros((pop_size, in_dim, 32), dtype=np.float32)
         self.b1 = np.zeros((pop_size, 32), dtype=np.float32)
@@ -315,13 +314,21 @@ class FastNeuroEvolution:
     def forward(self, obs: np.ndarray) -> np.ndarray:
         N = obs.shape[0]
 
-        # Calculate jump opportunity purely in NumPy to prevent any DSL array slice conflicts
+        # Calculate calculated jump opportunity with approach speed and clear runway
         center_ray = obs[:, 2]
         ego_target_x = obs[:, 10]
+        ego_vel_x = obs[:, 12]
         can_jump = obs[:, 14]
-        jump_opp = ((ego_target_x > 0.35) & (center_ray < 0.55) & (can_jump > 0.5)).astype(np.float32)[:, None]
 
-        # 16-dimensional input vector
+        # Trigger readiness only when speed is high, heading roughly toward target, and barrier is detected
+        jump_opp = (
+            (ego_target_x > 0.15) &
+            (ego_vel_x > 0.22) &
+            (center_ray < 0.65) &
+            (center_ray > 0.18) &
+            (can_jump > 0.5)
+        ).astype(np.float32)[:, None]
+
         obs_16 = np.hstack([obs, jump_opp])
 
         w1, b1 = self.W1[:N], self.b1[:N]
@@ -335,7 +342,7 @@ class FastNeuroEvolution:
         raw_out = np.tanh(np.matmul(h2[:, None, :], w3).squeeze(1) + b3)
 
         steer = raw_out[:, 0:1]
-        throttle = np.clip(0.65 + 0.35 * raw_out[:, 1:2], 0.45, 1.0)
+        throttle = np.clip(0.60 + 0.40 * raw_out[:, 1:2], 0.35, 1.0)
         jump = raw_out[:, 2:3]
 
         return np.hstack([steer, throttle, jump]).astype(np.float32)
@@ -396,16 +403,75 @@ class FastNeuroEvolution:
 
             init_dist = obs[:, 6].copy()
             min_dist = init_dist.copy()
+            start_xy = envs.state["pos"].copy()
+
+            # Dynamic jump tracking for safe landing & anti back-and-forth enforcement
+            in_air = np.zeros(self.pop_size, dtype=bool)
+            takeoff_pos = np.zeros((self.pop_size, 2), dtype=np.float32)
+            last_land_pos = start_xy.copy()
+            total_jump_bonus = np.zeros(self.pop_size, dtype=np.float32)
+            safe_jumps = np.zeros(self.pop_size, dtype=np.int32)
+            visited_cells = [set() for _ in range(self.pop_size)]
 
             for step_idx in range(rollout_steps):
                 act = self.forward(obs)
                 obs, rewards, term, trunc, _ = envs.step(act)
 
+                cur_pos = envs.state["pos"]
+                cur_z = envs.state["z"]
+                crashed = envs.state["crashed"] > 0.5
                 cur_dist = obs[:, 6]
-                alt = obs[:, 9]
-                max_altitude = np.maximum(max_altitude, alt)
 
-                reached = alive & (cur_dist < 1.8)
+                max_altitude = np.maximum(max_altitude, cur_z)
+
+                # Track grid cell exploration
+                for i in range(self.pop_size):
+                    if alive[i]:
+                        gx, gy = int(cur_pos[i, 0]), int(cur_pos[i, 1])
+                        visited_cells[i].add((gx, gy))
+
+                # 1. Detect Takeoff
+                takeoff_now = alive & (~in_air) & (cur_z > 0.08)
+                takeoff_pos[takeoff_now] = cur_pos[takeoff_now]
+                in_air[takeoff_now] = True
+
+                # 2. Detect Landing
+                landing_now = alive & in_air & (cur_z <= 0.04)
+
+                # STRICT CRITERIA: Only reward jumps that land safely and don't kill the agent!
+                safe_landing = landing_now & (~crashed)
+
+                if np.any(safe_landing):
+                    jump_disp = cur_pos[safe_landing] - takeoff_pos[safe_landing]
+                    jump_dist = np.linalg.norm(jump_disp, axis=1)
+
+                    # Anti-Oscillation / Back-and-Forth Detection
+                    prog_from_last = cur_pos[safe_landing] - last_land_pos[safe_landing]
+                    net_prog = np.linalg.norm(prog_from_last, axis=1)
+
+                    # Also verify forward distance relative to start
+                    dist_to_start_now = np.linalg.norm(cur_pos[safe_landing] - start_xy[safe_landing], axis=1)
+                    dist_to_start_prev = np.linalg.norm(takeoff_pos[safe_landing] - start_xy[safe_landing], axis=1)
+                    backwards_jump = dist_to_start_now < (dist_to_start_prev - 0.5)
+
+                    is_jitter = (net_prog < 1.8) | backwards_jump
+
+                    # Large reward for legitimate forward distance, heavy penalty for jumping back-and-forth
+                    payout = np.where(
+                        (~is_jitter) & (jump_dist > 1.5),
+                        jump_dist * 50.0 + 120.0,
+                        -60.0
+                    )
+
+                    total_jump_bonus[safe_landing] += payout
+                    safe_jumps[safe_landing] += np.where(~is_jitter, 1, 0)
+                    last_land_pos[safe_landing] = cur_pos[safe_landing]
+
+                # Reset flight status
+                in_air[landing_now] = False
+                in_air[crashed] = False
+
+                reached = alive & (cur_dist < 1.8) & (cur_z <= 0.08)
                 newly_done = reached & (~completed)
                 completed |= reached
                 steps_to_goal = np.where(newly_done, step_idx + 1, steps_to_goal)
@@ -417,19 +483,28 @@ class FastNeuroEvolution:
                 if not np.any(alive):
                     break
 
+            # 3. Maze Exploration & Goal Reward Assembly
             progress = np.maximum(0.0, init_dist - min_dist)
-            fitness += progress * 100.0
+            fitness += progress * 110.0
 
-            finish_bonus = np.where(completed, 10000.0 + (rollout_steps - steps_to_goal) * 30.0, 0.0)
+            # Cell exploration bonus encourages mapping corridors without any BFS cheating
+            explored_count = np.array([len(s) for s in visited_cells], dtype=np.float32)
+            fitness += explored_count * 24.0
+
+            # Add verified safe-landing bonuses
+            fitness += total_jump_bonus
+
+            # Finish bonus
+            finish_bonus = np.where(completed, 12000.0 + (rollout_steps - steps_to_goal) * 40.0, 0.0)
             fitness += finish_bonus
-            fitness += np.where(max_altitude > 0.5, 300.0, 0.0)
 
             top_fit = float(np.max(fitness))
             min_rem_dist = float(np.min(min_dist))
             num_solved = int(np.sum(completed))
+            total_safe_jumps = int(np.sum(safe_jumps))
 
             if verbose and (gen % 5 == 0 or gen == generations - 1):
-                print(f"   Gen {gen:02d}/{generations} | Top Fit: {top_fit:8.1f} | Closest to Goal: {min_rem_dist:4.1f}m | Solved: {num_solved:3d}/{self.pop_size} | Max Alt: {float(np.max(max_altitude)):.2f}m")
+                print(f"   Gen {gen:02d}/{generations} | Top Fit: {top_fit:8.1f} | Closest: {min_rem_dist:4.1f}m | Solved: {num_solved:3d}/{self.pop_size} | Safe Jumps: {total_safe_jumps:3d} | Max Alt: {float(np.max(max_altitude)):.2f}m")
 
             self.evolve(fitness)
 
@@ -783,7 +858,7 @@ class CyberVisualizer3D:
         # Thruster
         is_firing = jump_val > 0.0
         jump_color = (192, 132, 252) if is_firing else (71, 85, 105)
-        jump_state = "FIRING [WALL-JUMP]" if is_firing else "GROUND"
+        jump_state = "FIRING [SAFE LAUNCH]" if is_firing else "GROUND"
         self.screen.blit(self.font_main.render(f"3D THRUSTER: [{jump_state}]", True, jump_color), (300, hud_y + 74))
 
         # Camera Controls Guide
